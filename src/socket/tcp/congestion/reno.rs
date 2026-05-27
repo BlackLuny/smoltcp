@@ -27,7 +27,7 @@ impl Controller for Reno {
         self.cwnd
     }
 
-    fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &RttEstimator) {
+    fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
         let len = if self.cwnd < self.ssthresh {
             // Slow start.
             len
@@ -43,11 +43,11 @@ impl Controller for Reno {
             .max(self.min_cwnd);
     }
 
-    fn on_duplicate_ack(&mut self, _now: Instant) {
+    fn on_dup_ack(&mut self, _now: Instant, _len: usize, _in_flight: usize) {
         self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
     }
 
-    fn on_retransmit(&mut self, _now: Instant) {
+    fn on_rto(&mut self, _now: Instant, _in_flight: usize) {
         self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
     }
 
@@ -81,7 +81,7 @@ mod test {
                 // Set remote window.
                 reno.set_remote_window(remote_window);
 
-                reno.on_ack(now, 4096, &RttEstimator::default());
+                reno.on_ack(now, 4096, reno.window(), &RttEstimator::default());
 
                 let mut n = i;
                 for _ in 0..j {
@@ -89,13 +89,13 @@ mod test {
                 }
 
                 if i & 1 == 0 {
-                    reno.on_retransmit(now);
+                    reno.on_rto(now, reno.window());
                 } else {
-                    reno.on_duplicate_ack(now);
+                    reno.on_dup_ack(now, 1480, reno.window());
                 }
 
                 let elapsed = Instant::from_millis(1000);
-                reno.on_ack(elapsed, n, &RttEstimator::default());
+                reno.on_ack(elapsed, n, reno.window(), &RttEstimator::default());
 
                 let cwnd = reno.window();
                 println!("Reno: elapsed = {}, cwnd = {}", elapsed, cwnd);
@@ -115,7 +115,7 @@ mod test {
         reno.set_remote_window(remote_window);
 
         for _ in 0..100 {
-            reno.on_retransmit(now);
+            reno.on_rto(now, reno.window());
             assert!(reno.window() >= reno.min_cwnd);
         }
     }
