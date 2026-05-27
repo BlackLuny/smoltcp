@@ -1,4 +1,4 @@
-use crate::time::Instant;
+use crate::{socket::tcp::RttEstimator, time::Instant};
 
 use super::Controller;
 
@@ -38,13 +38,13 @@ impl Controller for Cubic {
         self.cwnd
     }
 
-    fn on_retransmit(&mut self, now: Instant) {
+    fn on_rto(&mut self, now: Instant, _in_flight: usize) {
         self.w_max = self.cwnd;
         self.ssthresh = self.cwnd >> 1;
         self.recovery_start = Some(now);
     }
 
-    fn on_duplicate_ack(&mut self, now: Instant) {
+    fn on_dup_ack(&mut self, now: Instant, _len: usize, _in_flight: usize) {
         self.w_max = self.cwnd;
         self.ssthresh = self.cwnd >> 1;
         self.recovery_start = Some(now);
@@ -56,7 +56,7 @@ impl Controller for Cubic {
         }
     }
 
-    fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
+    fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
         // Slow start.
         if self.cwnd < self.ssthresh {
             self.cwnd = self
@@ -171,9 +171,9 @@ mod test {
                 cubic.set_mss(1480);
 
                 if i & 1 == 0 {
-                    cubic.on_retransmit(now);
+                    cubic.on_rto(now, cubic.window());
                 } else {
-                    cubic.on_duplicate_ack(now);
+                    cubic.on_dup_ack(now, 1480, cubic.window());
                 }
 
                 cubic.pre_transmit(now);
@@ -202,7 +202,7 @@ mod test {
         let t1 = Instant::from_micros(0);
         let t2 = Instant::from_micros(i64::MAX);
 
-        cubic.on_retransmit(t2);
+        cubic.on_rto(t2, cubic.window());
         cubic.pre_transmit(t1);
 
         let cwnd = cubic.window();
@@ -219,7 +219,7 @@ mod test {
         let t1 = Instant::from_millis(0);
         let t2 = Instant::from_micros(i64::MAX);
 
-        cubic.on_retransmit(t1);
+        cubic.on_rto(t1, cubic.window());
         cubic.pre_transmit(t2);
 
         let cwnd = cubic.window();
@@ -238,7 +238,7 @@ mod test {
         let t3 = Instant::from_millis(199);
         let t4 = Instant::from_millis(20000);
 
-        cubic.on_retransmit(t1);
+        cubic.on_rto(t1, cubic.window());
 
         cubic.pre_transmit(t2);
         let cwnd2 = cubic.window();
@@ -267,20 +267,20 @@ mod test {
         let cwnd = cubic.window();
         let ack_len = 1024;
 
-        cubic.on_ack(t1, ack_len, &RttEstimator::default());
+        cubic.on_ack(t1, ack_len, cubic.window(), &RttEstimator::default());
 
         assert!(cubic.window() > cwnd);
 
         for i in 1..1000 {
             let t2 = Instant::from_micros(i);
-            cubic.on_ack(t2, ack_len * 100, &RttEstimator::default());
+            cubic.on_ack(t2, ack_len * 100, cubic.window(), &RttEstimator::default());
             assert!(cubic.window() <= cubic.rwnd);
         }
 
         let t3 = Instant::from_micros(2000);
 
         let cwnd = cubic.window();
-        cubic.on_retransmit(t3);
+        cubic.on_rto(t3, cubic.window());
         assert_eq!(cwnd >> 1, cubic.ssthresh);
     }
 
