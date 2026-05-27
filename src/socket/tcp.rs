@@ -1612,6 +1612,11 @@ impl<'a> Socket<'a> {
         self.congestion_controller.inner().window()
     }
 
+    /// Number of octets transmitted but not yet ACKed.
+    fn flight_size(&self) -> usize {
+        self.remote_last_seq - self.local_seq_no
+    }
+
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
     /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
     /// and not only the octets that may be returned as a contiguous slice.
@@ -2065,11 +2070,6 @@ impl<'a> Socket<'a> {
 
                 ack_all = self.remote_last_seq <= ack_number;
             }
-
-            self.rtte.on_ack(cx.now(), ack_number);
-            self.congestion_controller
-                .inner_mut()
-                .on_ack(cx.now(), ack_len, &self.rtte);
         }
 
         // Disregard control flags we don't care about or shouldn't act on yet.
@@ -2304,14 +2304,10 @@ impl<'a> Socket<'a> {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
-            // Detect and react to duplicate ACKs by:
-            // 1. Check if duplicate ACK and change self.local_rx_dup_acks accordingly
-            // 2. If exactly 3 duplicate ACKs received, set for fast retransmit
-            // 3. Update the last received ACK (self.local_rx_last_ack)
             match self.local_rx_last_ack {
                 // Duplicate ACK if payload empty and ACK doesn't move send window ->
-                // Increment duplicate ACK count and set for retransmit if we just received
-                // the third duplicate ACK
+                // Increment duplicate ACK count, notify congestion controller and
+                // set for retransmit if we just received the third duplicate ACK
                 Some(last_rx_ack)
                     if repr.payload.is_empty()
                         && last_rx_ack == ack_number
@@ -2320,11 +2316,6 @@ impl<'a> Socket<'a> {
                 {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-
-                    // Inform congestion controller of duplicate ACK
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
 
                     net_debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
@@ -2341,19 +2332,41 @@ impl<'a> Socket<'a> {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
+
+                    // Notify of duplicate ACK
+                    let in_flight = self.flight_size();
+                    self.congestion_controller.inner_mut().on_dup_ack(
+                        cx.now(),
+                        self.remote_mss,
+                        in_flight,
+                    );
                 }
-                // No duplicate ACK -> Reset state and update last received ACK
+
+                // No duplicate ACK means we reset the duplicate ACK count
+                // and notify the congestion controller of the fresh ACK
                 _ => {
                     if self.local_rx_dup_acks > 0 {
                         self.local_rx_dup_acks = 0;
                         net_debug!("reset duplicate ACK count");
                     }
                     self.local_rx_last_ack = Some(ack_number);
+
+                    // Notify of fresh ACK
+                    self.rtte.on_ack(cx.now(), ack_number);
+                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
+                    self.congestion_controller.inner_mut().on_ack(
+                        cx.now(),
+                        ack_len,
+                        new_flight_size,
+                        &self.rtte,
+                    );
                 }
             };
+
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
             // Do not attempt to retransmit the latter segments; not only this is pointless
@@ -2672,13 +2685,32 @@ impl<'a> Socket<'a> {
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
-            // If a retransmit timer expired, we should resend data starting at the last ACK.
-            net_debug!("retransmitting");
+            if let Timer::Retransmit { .. } = self.timer {
+                // If a retransmit timer expired, we should resend data starting at the last ACK.
+                net_debug!("retransmitting after rto");
 
-            // Rewind "last sequence number sent", as if we never
-            // had sent them. This will cause all data in the queue
-            // to be sent again.
-            self.remote_last_seq = self.local_seq_no;
+                // Inform the congestion controller that we're retransmitting and should enter the slow start state
+                let in_flight = self.flight_size();
+                self.congestion_controller
+                    .inner_mut()
+                    .on_rto(cx.now(), in_flight);
+
+                // Rewind "last sequence number sent", as if we never
+                // had sent them. This will cause all data in the queue
+                // to be sent again.
+                self.remote_last_seq = self.local_seq_no;
+            } else {
+                // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
+                net_debug!("retranmitting for fast-retransmit");
+
+                // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
+                let in_flight = self.flight_size();
+                self.congestion_controller
+                    .inner_mut()
+                    .on_loss(cx.now(), in_flight);
+
+                self.remote_last_seq = self.local_seq_no;
+            }
 
             // Clear the `should_retransmit` state. If we can't retransmit right
             // now for whatever reason (like zero window), this avoids an
@@ -2688,11 +2720,6 @@ impl<'a> Socket<'a> {
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
-
-            // Inform the congestion controller that we're retransmitting.
-            self.congestion_controller
-                .inner_mut()
-                .on_retransmit(cx.now());
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -2878,7 +2905,7 @@ impl<'a> Socket<'a> {
             tcp_trace!(
                 "tx buffer: sending {} octets at offset {}",
                 repr.payload.len(),
-                self.remote_last_seq - self.local_seq_no
+                self.flight_size()
             );
         }
         if repr.control != TcpControl::None || repr.payload.is_empty() {
