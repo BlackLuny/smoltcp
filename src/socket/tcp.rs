@@ -336,12 +336,7 @@ impl RttEstimator {
         }
     }
 
-    fn on_retransmit(&mut self) {
-        if self.timestamp.is_some() {
-            tcp_trace!("rtte: abort sampling due to retransmit");
-        }
-        self.timestamp = None;
-
+    fn on_rto(&mut self) {
         // RFC 6298 (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").  The
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
@@ -359,6 +354,13 @@ impl RttEstimator {
             self.have_measurement = false;
             tcp_trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
         }
+    }
+
+    fn on_retransmit(&mut self) {
+        if self.timestamp.is_some() {
+            tcp_trace!("rtte: abort sampling due to retransmit");
+        }
+        self.timestamp = None;
     }
 }
 
@@ -2719,6 +2721,9 @@ impl<'a> Socket<'a> {
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
                 self.remote_last_seq = self.local_seq_no;
+
+                // Inform RTTE, so that it can can handle RTO backoff
+                self.rtte.on_rto();
             } else {
                 // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
                 net_debug!("retransmitting for fast-retransmit");
