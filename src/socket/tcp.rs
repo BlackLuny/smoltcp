@@ -1617,6 +1617,13 @@ impl<'a> Socket<'a> {
         self.remote_last_seq - self.local_seq_no
     }
 
+    fn cwnd_remaining(&self) -> usize {
+        self.congestion_controller
+            .inner()
+            .window()
+            .saturating_sub(self.flight_size())
+    }
+
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
     /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
     /// and not only the octets that may be returned as a contiguous slice.
@@ -2539,14 +2546,14 @@ impl<'a> Socket<'a> {
             self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
 
         // Max amount of octets we can send.
-        let max_send = if max_send_seq >= self.remote_last_seq {
+        let capped_send_seq = if max_send_seq >= self.remote_last_seq {
             max_send_seq - self.remote_last_seq
         } else {
             0
         };
 
-        // Compare max_send with the congestion window.
-        let max_send = max_send.min(self.congestion_controller.inner().window());
+        // compare max bytes allowed by cwnd with max bytes allowed by remote
+        let max_send = capped_send_seq.min(self.cwnd_remaining());
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -2853,15 +2860,16 @@ impl<'a> Socket<'a> {
                     is_zero_window_probe = true;
                 }
 
-                // Maximum size we're allowed to send. This can be limited by 3 factors:
+                // Maximum size we're allowed to send. This can be limited by 4 factors:
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
+                // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
 
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
-                let size = win_limit.min(effective_mss);
+                let size = win_limit.min(effective_mss).min(self.cwnd_remaining());
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
