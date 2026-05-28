@@ -2,6 +2,8 @@ use crate::{socket::tcp::RttEstimator, time::Instant};
 
 use super::Controller;
 
+const DEFAULT_MSS: usize = 1024;
+
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Reno {
@@ -9,15 +11,18 @@ pub struct Reno {
     min_cwnd: usize,
     ssthresh: usize,
     rwnd: usize,
+
+    in_fast_recovery: bool,
 }
 
 impl Reno {
     pub fn new() -> Self {
         Reno {
-            cwnd: 1024 * 2,
-            min_cwnd: 1024 * 2,
+            cwnd: DEFAULT_MSS * 2,
+            min_cwnd: DEFAULT_MSS * 2,
             ssthresh: usize::MAX,
-            rwnd: 64 * 1024,
+            rwnd: 64 * DEFAULT_MSS,
+            in_fast_recovery: false,
         }
     }
 }
@@ -28,27 +33,57 @@ impl Controller for Reno {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
-        let len = if self.cwnd < self.ssthresh {
-            // Slow start.
-            len
+        // First new-data-ack exits fast recovery and deflates `cwnd`
+        if self.in_fast_recovery {
+            self.in_fast_recovery = false;
+            self.cwnd = self.ssthresh;
+            return;
+        }
+
+        let inc = if self.cwnd < self.ssthresh {
+            // Slow start: increase `cwnd` by 1 MSS per ACK.
+            len.min(self.min_cwnd)
         } else {
-            self.ssthresh = self.cwnd;
-            self.min_cwnd
+            // Congestion avoidance: increase by ~1 MSS per RTT.
+            (self.min_cwnd * self.min_cwnd / self.cwnd).max(1)
         };
 
         self.cwnd = self
             .cwnd
-            .saturating_add(len)
+            .saturating_add(inc)
             .min(self.rwnd)
             .max(self.min_cwnd);
     }
 
-    fn on_dup_ack(&mut self, _now: Instant, _len: usize, _in_flight: usize) {
-        self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
+    fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
+        if self.in_fast_recovery {
+            self.cwnd = self
+                .cwnd
+                .saturating_add(len)
+                .min(self.rwnd)
+                .max(self.min_cwnd);
+        }
     }
 
-    fn on_rto(&mut self, _now: Instant, _in_flight: usize) {
-        self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
+    fn on_loss(&mut self, _now: Instant, in_flight: usize) {
+        // Only cut window size on first entrance to fast recovery.
+        if !self.in_fast_recovery {
+            self.ssthresh = (in_flight >> 1).max(2 * self.min_cwnd);
+            self.cwnd = self
+                .ssthresh
+                .min(self.rwnd)
+                .saturating_add(3 * self.min_cwnd);
+
+            self.in_fast_recovery = true;
+        }
+    }
+
+    fn on_rto(&mut self, _now: Instant, in_flight: usize) {
+        self.ssthresh = (in_flight >> 1).max(2 * self.min_cwnd);
+        self.cwnd = self.min_cwnd;
+
+        // Major loss has occurred, ensure we move from fast recovery (if in it) to slow start.
+        self.in_fast_recovery = false
     }
 
     fn set_mss(&mut self, mss: usize) {
