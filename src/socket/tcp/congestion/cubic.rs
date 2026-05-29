@@ -226,46 +226,65 @@ impl Controller for Cubic {
     }
 }
 
-#[inline]
-fn abs(a: f64) -> f64 {
-    if a < 0.0 { -a } else { a }
-}
-
-/// Calculate cube root by using the Newton-Raphson method.
+/// Efficient cube root using f64 bit tricks and Newton-Raphson.
+///
+/// a = mantissa * 2^e
+///
+/// cbrt(a) = cbrt(mantissa * 2^e)
+/// cbrt(a) = cbrt(mantissa) * cbrt(2^e)
+/// -> cbrt(2^e) = 2^(e/3)
+///     -> e = 3q + r
+///   -> 2^(e/3) = 2^(3q + r)
+///   -> 2^(e/3) = 2^q * 2^(r/3)
+/// cbrt(a) = cbrt(mantissa) * 2^q * 2^(r/3)
+///
+/// Floats are constructed from a mantissa and expontnet component.
+/// Cbrt of a float can be achieved by cbrt of these two components.
+///
+/// The mantissa is always between 1 and 2 so we just use the center of the cbrt range.
+/// The error here is never greater than 12%. Later iterations eliminate it.
+///
+/// The exponent `e` of `2^e` has two parts, tt's quotient and remainder: `e = 3q + r`.
+/// Which means cbrt `2^e` is cbrt `2^3q * 2^r` which becomes `2^q * 2^(r/3)`.
+///
+/// The remainder operation means `r` can only be 0, 1, or 2, so we can calaculate
+/// `2^(r/3)` ahead of time.
+///
+/// Multiplying everything gets us a pretty close answer to the true cbrt.
+/// `cbrt(a) = cbrt(mantissa) * 2^q * 2^(r/3)`
+///
+/// One or two Newton-Raphson iterations reduce any error enough not to matter.
 fn cube_root(a: f64) -> Option<f64> {
-    if a <= 0.0 {
+    if !(a > 0.0 && a.is_finite()) {
         return None;
     }
 
-    let (tolerance, init) = if a < 1_000.0 {
-        (1.0, 8.879040017426005) // cube_root(700.0)
-    } else if a < 1_000_000.0 {
-        (5.0, 88.79040017426004) // cube_root(700_000.0)
-    } else if a < 1_000_000_000.0 {
-        (50.0, 887.9040017426004) // cube_root(700_000_000.0)
-    } else if a < 1_000_000_000_000.0 {
-        (500.0, 8879.040017426003) // cube_root(700_000_000_000.0)
-    } else if a < 1_000_000_000_000_000.0 {
-        (5000.0, 88790.40017426001) // cube_root(700_000_000_000.0)
-    } else {
-        (50000.0, 887904.0017426) // cube_root(700_000_000_000_000.0)
-    };
+    const CBRT_MANTISSA: f64 = 1.1224620483093730;
+    const REM_COMPONENT: [f64; 3] = [1.0, 1.2599210498948732, 1.5874010519681994];
 
-    let mut x = init; // initial value
-    let mut n = 20; // The maximum iteration
-    loop {
-        let next_x = (2.0 * x + a / (x * x)) / 3.0;
-        if abs(next_x - x) < tolerance {
-            return Some(next_x);
-        }
-        x = next_x;
+    // decompose a into IEEE-754 components
+    let bits = a.to_bits();
 
-        if n == 0 {
-            return Some(next_x);
-        }
+    // extract exponent, break into quotient and remainder
+    // e = 3q + r where r ∈ {0, 1, 2}
+    let e = (((bits >> 52) & 0x7FF) as i64) - 1023;
+    let q = e.div_euclid(3);
+    let r = e.rem_euclid(3) as usize;
 
-        n -= 1;
+    // calculate 2^q efficiently by constructing f64 from bits
+    let pow2q = f64::from_bits(((q + 1023) as u64) << 52);
+
+    // add cbrt mantissa and other component back in:
+    // cbrt mantiassa * 2^q * 2^(r/3)
+    let mut x = CBRT_MANTISSA * pow2q * REM_COMPONENT[r];
+
+    // limited iterations should bring us close enough
+    // within 3 or 4 sf in the worse-case with 12% error on start
+    for _ in 0..2 {
+        x = (2.0 * x + a / (x * x)) / 3.0;
     }
+
+    Some(x)
 }
 
 #[cfg(test)]
