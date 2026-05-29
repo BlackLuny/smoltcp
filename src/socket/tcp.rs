@@ -220,10 +220,15 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn smoothed_rtt(&self) -> u32 {
+        if self.have_measurement { self.srtt } else { 0 }
+    }
+
     /// Smoothed RTT (RFC 6298 `srtt`), or `None` if no measurement has been taken
     /// yet. Used by the Brutal congestion controller to size its BDP window.
     #[cfg(feature = "socket-tcp-brutal")]
-    pub(super) fn smoothed_rtt(&self) -> Option<Duration> {
+    pub(super) fn smoothed_rtt_opt(&self) -> Option<Duration> {
         if self.have_measurement {
             Some(Duration::from_millis(self.srtt as u64))
         } else {

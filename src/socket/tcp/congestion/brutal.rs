@@ -74,7 +74,7 @@ impl Controller for Brutal {
 
     fn on_ack(&mut self, _now: Instant, _len: usize, rtt: &RttEstimator) {
         // Track RTT for BDP sizing. (Loss is intentionally not tracked in phase 1.)
-        if let Some(srtt) = rtt.smoothed_rtt() {
+        if let Some(srtt) = rtt.smoothed_rtt_opt() {
             self.rtt = srtt;
         }
     }
