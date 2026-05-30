@@ -1390,6 +1390,17 @@ impl<'a> Socket<'a> {
         self.tx_buffer.len()
     }
 
+    /// Diagnostic: peer's advertised receive window in octets (rwnd), already de-scaled.
+    /// This is the in-flight cap imposed by the remote.
+    pub fn remote_window(&self) -> usize {
+        self.remote_win_len
+    }
+
+    /// Diagnostic: current congestion window (cwnd) in octets from the active controller.
+    pub fn congestion_window(&self) -> usize {
+        self.congestion_controller.inner().window()
+    }
+
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
     /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
     /// and not only the octets that may be returned as a contiguous slice.
