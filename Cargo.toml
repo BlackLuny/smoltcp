@@ -89,6 +89,9 @@ defmt = ["dep:defmt", "heapless/defmt-03"]
 # Enable Reno TCP congestion control algorithm, and it is used as a default congestion controller.
 "socket-tcp-reno" = []
 
+# Enable BBR TCP congestion control algorithm, and it is used as a default congestion controller.
+"socket-tcp-bbr" = []
+
 "packetmeta-id" = []
 
 "async" = []
