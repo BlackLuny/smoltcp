@@ -545,9 +545,14 @@ impl Bbr {
         }
 
         self.round_wo_bw_gain += 1;
-        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64
-            || (self.recovery_state.in_recovery())
-        {
+        // NOTE(zfc): do NOT exit STARTUP merely because we entered loss recovery.
+        // Linux BBRv1 exits STARTUP only on sustained no-bandwidth-growth (≥3 rounds);
+        // exiting on the first loss makes BBR loss-INTOLERANT — the opposite of its
+        // purpose. On lossy paths (e.g. CN→cloud WG-inbound, ~kpps retransmits where
+        // kernel BBR still does 600M+) the original `|| in_recovery()` clause locked
+        // BtlBw/cwnd at the startup-reached value → single-flow collapsed to ~cwnd/RTT
+        // (~20Mbps). Probe through loss; let the no-growth counter end STARTUP.
+        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64 {
             self.is_at_full_bandwidth = true;
         }
     }
@@ -641,10 +646,17 @@ impl Bbr {
 
 impl Controller for Bbr {
     fn window(&self) -> usize {
+        // NOTE(zfc): do NOT cap cwnd to the Chromium-style packet-conservation
+        // `recovery_window` on loss. On a persistently lossy path (CN→cloud WG
+        // inbound, ~kpps retransmits where kernel BBR still does 600M+) a loss occurs
+        // almost every round, so the connection never leaves recovery and cwnd stays
+        // pinned at ~in-flight (~one BDP) → single-flow collapses to ~cwnd/RTT
+        // (~20Mbps). Linux BBRv1 keeps cwnd loss-independent (= cwnd_gain × BDP) and
+        // relies on ProbeRTT/BtlBw, not loss, for sizing. Use the BBR target cwnd
+        // directly so loss tolerance actually works. See zfc
+        // docs/design/wireguard-inbound-throughput.md.
         let cwnd = if self.mode == Mode::ProbeRtt {
             self.get_probe_rtt_cwnd()
-        } else if self.recovery_state.in_recovery() && self.mode != Mode::Startup {
-            self.cwnd.min(self.recovery_window)
         } else {
             self.cwnd
         };
@@ -704,7 +716,21 @@ impl Controller for Bbr {
     }
 
     fn pacing_rate(&self) -> u64 {
-        self.pacing_rate
+        // NOTE(zfc): fine-grained pacing is DISABLED for this fork (return 0 →
+        // tcp.rs treats the socket as cwnd-only / ACK-clocked).
+        //
+        // BBR's pacing assumes a sub-millisecond timer (Linux pairs it with the fq
+        // qdisc). Here the netstack runs on a tokio loop whose `sleep` granularity is
+        // ~1ms — far coarser than the per-packet pacing interval at high rates. With
+        // pacing on, a single flow emits only ~one small burst per wake, so the BBR
+        // delivery-rate sample never exceeds that, BtlBw stalls low, and pacing locks
+        // the flow at ~cwnd-headroom/wake (~20Mbps @ ~40ms RTT) even though cwnd is
+        // wide open. cwnd-only BBR keeps the loss tolerance we actually want (cwnd =
+        // cwnd_gain × BDP probes bandwidth via the in-flight headroom, loss does not
+        // shrink BtlBw) while letting smoltcp drain the whole window per poll.
+        // See zfc docs/design/wireguard-inbound-throughput.md.
+        let _ = self.pacing_rate; // still computed (diagnostics); intentionally unused
+        0
     }
 }
 
