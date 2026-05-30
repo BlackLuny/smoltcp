@@ -157,6 +157,14 @@ const RTTE_MAX_RTO: u32 = 10000;
 #[cfg(feature = "socket-tcp-bbr")]
 const BBR_MIN_RTT_WIN_SEC: u64 = 10;
 
+// Pacing catch-up bound (microseconds). When the host wakes the stack late or at
+// coarse granularity (e.g. tokio's ~1ms sleep floor), pacing advances the next-send
+// deadline from the previous deadline rather than `now`, letting one poll() drain
+// the accumulated backlog as a burst. This caps how far behind schedule we let the
+// deadline fall before re-anchoring to `now`, so a long idle can't unleash a huge
+// burst. 2ms ≈ a couple host timer ticks of catch-up.
+const MAX_PACING_BACKLOG_US: i64 = 2000;
+
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct RttEstimator {
@@ -2629,7 +2637,22 @@ impl<'a> Socket<'a> {
                 let packet_size = repr.segment_len() as u64;
                 let delay_micros = (packet_size * 1_000_000) / pacing_rate;
                 let delay = crate::time::Duration::from_micros(delay_micros);
-                self.pacing_next_send_at = Some(cx.now() + delay);
+                // Bounded catch-up: advance from the PREVIOUS deadline (not `now`) when
+                // we're at most MAX_PACING_BACKLOG_US behind schedule, so a late/coarse
+                // host wake can emit the backlog in one poll() burst instead of being
+                // throttled to one packet per wake. Re-anchor to `now` on first packet,
+                // after idle, or when too far behind (avoids post-idle burst).
+                let now = cx.now();
+                let base = match self.pacing_next_send_at {
+                    Some(prev)
+                        if prev.total_micros() <= now.total_micros()
+                            && now.total_micros() - prev.total_micros() <= MAX_PACING_BACKLOG_US =>
+                    {
+                        prev
+                    }
+                    _ => now,
+                };
+                self.pacing_next_send_at = Some(base + delay);
                 tcp_trace!(
                     "pacing: sent {} bytes at rate {} bytes/s, next send at {:?}",
                     packet_size,
