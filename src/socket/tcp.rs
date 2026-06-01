@@ -161,6 +161,19 @@ const RTTE_MIN_RTO: u32 = 1000;
 // seconds
 const RTTE_MAX_RTO: u32 = 60_000;
 
+// BBR: Window length for min_rtt filter (in seconds)
+// This matches the Linux kernel BBR implementation (tcp_bbr.c:135)
+#[cfg(feature = "socket-tcp-bbr")]
+const BBR_MIN_RTT_WIN_SEC: u64 = 10;
+
+// Pacing catch-up bound (microseconds). When the host wakes the stack late or at
+// coarse granularity (e.g. tokio's ~1ms sleep floor), pacing advances the next-send
+// deadline from the previous deadline rather than `now`, letting one poll() drain
+// the accumulated backlog as a burst. This caps how far behind schedule we let the
+// deadline fall before re-anchoring to `now`, so a long idle can't unleash a huge
+// burst. 2ms ≈ a couple host timer ticks of catch-up.
+const MAX_PACING_BACKLOG_US: i64 = 2000;
+
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct RttEstimator {
@@ -176,6 +189,12 @@ struct RttEstimator {
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
+    /// BBR: Minimum RTT observed in the last 10 seconds
+    #[cfg(feature = "socket-tcp-bbr")]
+    min_rtt_value: u32,
+    /// BBR: Timestamp when min_rtt was last updated
+    #[cfg(feature = "socket-tcp-bbr")]
+    min_rtt_stamp: Option<Instant>,
 }
 
 impl Default for RttEstimator {
@@ -188,6 +207,10 @@ impl Default for RttEstimator {
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
+            #[cfg(feature = "socket-tcp-bbr")]
+            min_rtt_value: u32::MAX,
+            #[cfg(feature = "socket-tcp-bbr")]
+            min_rtt_stamp: None,
         }
     }
 }
@@ -197,7 +220,35 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
-    fn sample(&mut self, new_rtt: u32) {
+    // BBR: return the minimum RTT observed in the sliding window rather than the
+    // smoothed RTT. If no measurement yet, fall back to the smoothed RTT (srtt) as
+    // a reasonable estimate. (Upstream 0.13 switched the estimator from Van Jacobson
+    // `rtt`/`deviation` to RFC 6298 `srtt`/`rttvar`, so this reads `self.srtt`.)
+    #[cfg(feature = "socket-tcp-bbr")]
+    pub(super) fn min_rtt(&self) -> Duration {
+        if self.min_rtt_value == u32::MAX {
+            Duration::from_millis(self.srtt as _)
+        } else {
+            Duration::from_millis(self.min_rtt_value as _)
+        }
+    }
+
+    #[cfg(feature = "socket-tcp-bbr")]
+    pub(super) fn is_min_rtt_expired(&self, now: Instant) -> bool {
+        // Check if the min_rtt window has expired (10 seconds)
+        // This matches Linux kernel BBR behavior (tcp_bbr.c:948-949)
+        if let Some(stamp) = self.min_rtt_stamp {
+            if now >= stamp {
+                (now - stamp) > Duration::from_secs(BBR_MIN_RTT_WIN_SEC)
+            } else {
+                false // Time went backwards, don't consider expired
+            }
+        } else {
+            true // No measurement yet, consider expired
+        }
+    }
+
+    fn sample(&mut self, new_rtt: u32, #[allow(unused_variables)] now: Instant) {
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
             let diff = (self.srtt as i32 - new_rtt as i32).unsigned_abs();
@@ -215,6 +266,27 @@ impl RttEstimator {
         self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
 
         self.rto_count = 0;
+
+        // BBR: Track minimum RTT in a sliding 10-second window
+        // This matches Linux kernel BBR behavior (tcp_bbr.c:947-955)
+        #[cfg(feature = "socket-tcp-bbr")]
+        {
+            let expired = self.is_min_rtt_expired(now);
+
+            // Update min_rtt if:
+            // 1. New sample is lower than current minimum, OR
+            // 2. The window has expired (need fresh measurement)
+            if new_rtt < self.min_rtt_value || expired {
+                self.min_rtt_value = new_rtt;
+                self.min_rtt_stamp = Some(now);
+
+                tcp_trace!(
+                    "rtte: min_rtt updated to {:?}ms (expired={})",
+                    new_rtt,
+                    expired
+                );
+            }
+        }
 
         tcp_trace!(
             "rtte: sample={:?} srtt={:?} rttvar={:?} rto={:?}",
@@ -243,7 +315,7 @@ impl RttEstimator {
         if let Some((sent_timestamp, sent_seq)) = self.timestamp
             && seq >= sent_seq
         {
-            self.sample((timestamp - sent_timestamp).total_millis() as u32);
+            self.sample((timestamp - sent_timestamp).total_millis() as u32, timestamp);
             self.timestamp = None;
         }
     }
@@ -454,6 +526,9 @@ pub enum CongestionControl {
 
     #[cfg(feature = "socket-tcp-cubic")]
     Cubic,
+
+    #[cfg(feature = "socket-tcp-bbr")]
+    Bbr,
 }
 
 /// A Transmission Control Protocol socket.
@@ -533,6 +608,10 @@ pub struct Socket<'a> {
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
 
+    /// Pacing: next time a packet can be sent (for rate limiting).
+    /// If None, pacing is not active.
+    pacing_next_send_at: Option<Instant>,
+
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
 
@@ -605,6 +684,7 @@ impl<'a> Socket<'a> {
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
+            pacing_next_send_at: None,
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -657,6 +737,9 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-cubic")]
             CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
+
+            #[cfg(feature = "socket-tcp-bbr")]
+            CongestionControl::Bbr => AnyController::Bbr(bbr::Bbr::new()),
         }
     }
 
@@ -672,6 +755,9 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-cubic")]
             AnyController::Cubic(_) => CongestionControl::Cubic,
+
+            #[cfg(feature = "socket-tcp-bbr")]
+            AnyController::Bbr(_) => CongestionControl::Bbr,
         }
     }
 
@@ -1375,6 +1461,17 @@ impl<'a> Socket<'a> {
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn send_queue(&self) -> usize {
         self.tx_buffer.len()
+    }
+
+    /// Diagnostic: peer's advertised receive window in octets (rwnd), already de-scaled.
+    /// This is the in-flight cap imposed by the remote.
+    pub fn remote_window(&self) -> usize {
+        self.remote_win_len
+    }
+
+    /// Diagnostic: current congestion window (cwnd) in octets from the active controller.
+    pub fn congestion_window(&self) -> usize {
+        self.congestion_controller.inner().window()
     }
 
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
@@ -2385,6 +2482,12 @@ impl<'a> Socket<'a> {
             .inner_mut()
             .pre_transmit(cx.now());
 
+        // Notify congestion controller about available data for app-limited tracking
+        let bytes_available = self.tx_buffer.len();
+        self.congestion_controller
+            .inner_mut()
+            .on_send_ready(cx.now(), bytes_available);
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
@@ -2417,6 +2520,15 @@ impl<'a> Socket<'a> {
         #[cfg(feature = "socket-tcp-pause-synack")]
         if matches!(self.state, State::SynReceived) && self.synack_paused {
             return Ok(());
+        }
+
+        // Check if pacing delays transmission
+        if let Some(next_send_at) = self.pacing_next_send_at {
+            if cx.now() < next_send_at && self.seq_to_transmit(cx) {
+                // Pacing prevents us from sending data right now
+                tcp_trace!("pacing delayed until {:?}", next_send_at);
+                return Ok(());
+            }
         }
 
         // Decide whether we're sending a packet.
@@ -2657,6 +2769,41 @@ impl<'a> Socket<'a> {
             self.congestion_controller
                 .inner_mut()
                 .post_transmit(cx.now(), repr.segment_len());
+
+            // Update pacing: calculate when the next packet can be sent
+            let pacing_rate = self.congestion_controller.inner_mut().pacing_rate();
+            if pacing_rate > 0 {
+                // Calculate delay: (packet_size_bytes * 1_000_000) / pacing_rate_bytes_per_sec
+                // This gives us microseconds until the next packet can be sent
+                let packet_size = repr.segment_len() as u64;
+                let delay_micros = (packet_size * 1_000_000) / pacing_rate;
+                let delay = crate::time::Duration::from_micros(delay_micros);
+                // Bounded catch-up: advance from the PREVIOUS deadline (not `now`) when
+                // we're at most MAX_PACING_BACKLOG_US behind schedule, so a late/coarse
+                // host wake can emit the backlog in one poll() burst instead of being
+                // throttled to one packet per wake. Re-anchor to `now` on first packet,
+                // after idle, or when too far behind (avoids post-idle burst).
+                let now = cx.now();
+                let base = match self.pacing_next_send_at {
+                    Some(prev)
+                        if prev.total_micros() <= now.total_micros()
+                            && now.total_micros() - prev.total_micros() <= MAX_PACING_BACKLOG_US =>
+                    {
+                        prev
+                    }
+                    _ => now,
+                };
+                self.pacing_next_send_at = Some(base + delay);
+                tcp_trace!(
+                    "pacing: sent {} bytes at rate {} bytes/s, next send at {:?}",
+                    packet_size,
+                    pacing_rate,
+                    self.pacing_next_send_at
+                );
+            } else {
+                // No pacing
+                self.pacing_next_send_at = None;
+            }
         }
 
         if repr.segment_len() > 0 && !self.timer.is_retransmit() {
@@ -2694,7 +2841,11 @@ impl<'a> Socket<'a> {
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit.
-            PollAt::Now
+            // Check if pacing delays it.
+            match self.pacing_next_send_at {
+                Some(next_send_at) if cx.now() < next_send_at => PollAt::Time(next_send_at),
+                _ => PollAt::Now,
+            }
         } else if self.window_to_update() {
             // The receive window has been raised significantly.
             PollAt::Now
@@ -8705,9 +8856,11 @@ mod test {
             2076, 2060, 2048, 2036, 2028, 2024, 2020, 2016, 2012, 2012,
         ];
 
+        let mut now = Instant::from_millis(0);
         for &rto in rtos {
-            r.sample(2000);
+            r.sample(2000, now);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
+            now += Duration::from_millis(100); // Advance time
         }
     }
 
