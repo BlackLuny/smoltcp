@@ -220,6 +220,17 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    /// Smoothed RTT (RFC 6298 `srtt`), or `None` if no measurement has been taken
+    /// yet. Used by the Brutal congestion controller to size its BDP window.
+    #[cfg(feature = "socket-tcp-brutal")]
+    pub(super) fn smoothed_rtt(&self) -> Option<Duration> {
+        if self.have_measurement {
+            Some(Duration::from_millis(self.srtt as u64))
+        } else {
+            None
+        }
+    }
+
     // BBR: return the minimum RTT observed in the sliding window rather than the
     // smoothed RTT. If no measurement yet, fall back to the smoothed RTT (srtt) as
     // a reasonable estimate. (Upstream 0.13 switched the estimator from Van Jacobson
@@ -529,6 +540,9 @@ pub enum CongestionControl {
 
     #[cfg(feature = "socket-tcp-bbr")]
     Bbr,
+
+    #[cfg(feature = "socket-tcp-brutal")]
+    Brutal,
 }
 
 /// A Transmission Control Protocol socket.
@@ -618,6 +632,13 @@ pub struct Socket<'a> {
     /// Pacing: next time a packet can be sent (for rate limiting).
     /// If None, pacing is not active.
     pacing_next_send_at: Option<Instant>,
+    /// Pacing: max backlog (µs) a single late/coarse wake may catch up in one burst
+    /// before re-anchoring to `now`. Larger values tolerate a coarser host poll
+    /// cadence (e.g. tokio ~1ms+ timer) at the cost of burstier sends; smaller values
+    /// keep sends smooth but cap throughput to ~MSS/wake_interval when wakes are slow.
+    /// Defaults to [`MAX_PACING_BACKLOG_US`]; tunable per-socket via
+    /// [`set_pacing_max_backlog_us`](Self::set_pacing_max_backlog_us).
+    pacing_max_backlog_us: i64,
 
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
@@ -693,6 +714,7 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
             pacing_next_send_at: None,
+            pacing_max_backlog_us: MAX_PACING_BACKLOG_US,
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -748,7 +770,36 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-bbr")]
             CongestionControl::Bbr => AnyController::Bbr(bbr::Bbr::new()),
-        }
+
+            #[cfg(feature = "socket-tcp-brutal")]
+            CongestionControl::Brutal => AnyController::Brutal(brutal::Brutal::new()),
+        };
+
+        // Switching controllers invalidates any pacing deadline computed by the
+        // previous one (e.g. Brutal's fixed-rate spacing must not leak into Cubic/BBR).
+        self.pacing_next_send_at = None;
+    }
+
+    /// Inject the fixed target send rate (bytes/sec) for the Brutal congestion
+    /// controller. Returns `true` if the rate was applied, `false` if the current
+    /// controller is not Brutal (call `set_congestion_control(Brutal)` first).
+    ///
+    /// Brutal paces the socket at this fixed rate regardless of loss; the rate is
+    /// meaningless for other controllers, hence the boolean — callers should
+    /// `debug_assert!` it to catch an out-of-order apply rather than silently not
+    /// pacing.
+    #[cfg(feature = "socket-tcp-brutal")]
+    pub fn set_brutal_rate_bytes_per_sec(&mut self, bytes_per_sec: u64) -> bool {
+        self.congestion_controller.set_brutal_rate(bytes_per_sec)
+    }
+
+    /// Set the pacing catch-up backlog budget (µs). See [`pacing_max_backlog_us`].
+    /// A larger value lets a single coarse/late host wake emit a proportionally
+    /// larger burst (sustaining the paced rate under a ~1ms+ timer), at the cost of
+    /// burstier sends. Only meaningful when a paced congestion controller (Brutal)
+    /// is active. `0` disables catch-up (always re-anchor to `now` → 1 segment/wake).
+    pub fn set_pacing_max_backlog_us(&mut self, micros: i64) {
+        self.pacing_max_backlog_us = micros.max(0);
     }
 
     /// Return the current congestion control algorithm.
@@ -766,6 +817,9 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-bbr")]
             AnyController::Bbr(_) => CongestionControl::Bbr,
+
+            #[cfg(feature = "socket-tcp-brutal")]
+            AnyController::Brutal(_) => CongestionControl::Brutal,
         }
     }
 
@@ -1011,6 +1065,10 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+        // Clear any pacing deadline left by a previous connection. With Brutal this
+        // field is meaningful, and on listener-pool reuse (listen() -> reset() ->
+        // apply_cc()) a stale future deadline would otherwise delay the first send.
+        self.pacing_next_send_at = None;
 
         #[cfg(feature = "async")]
         {
@@ -2858,7 +2916,8 @@ impl<'a> Socket<'a> {
                 let base = match self.pacing_next_send_at {
                     Some(prev)
                         if prev.total_micros() <= now.total_micros()
-                            && now.total_micros() - prev.total_micros() <= MAX_PACING_BACKLOG_US =>
+                            && now.total_micros() - prev.total_micros()
+                                <= self.pacing_max_backlog_us =>
                     {
                         prev
                     }

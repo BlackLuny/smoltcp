@@ -97,6 +97,11 @@ defmt = ["dep:defmt", "heapless/defmt"]
 # Enable BBR TCP congestion control algorithm, and it is used as a default congestion controller.
 "socket-tcp-bbr" = []
 
+# Enable the Hysteria2-style "Brutal" fixed-rate congestion control (paced, loss-tolerant).
+# Selected per-socket at runtime via `Socket::set_congestion_control(CongestionControl::Brutal)`
+# + `set_brutal_rate_bytes_per_sec`; never a default.
+"socket-tcp-brutal" = []
+
 "packetmeta-id" = []
 
 "async" = []

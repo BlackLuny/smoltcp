@@ -13,6 +13,9 @@ pub(super) mod reno;
 #[cfg(feature = "socket-tcp-bbr")]
 pub(super) mod bbr;
 
+#[cfg(feature = "socket-tcp-brutal")]
+pub(super) mod brutal;
+
 #[allow(unused_variables)]
 pub(super) trait Controller {
     /// Returns the number of bytes that can be sent.
@@ -61,6 +64,9 @@ pub(super) enum AnyController {
 
     #[cfg(feature = "socket-tcp-bbr")]
     Bbr(bbr::Bbr),
+
+    #[cfg(feature = "socket-tcp-brutal")]
+    Brutal(brutal::Brutal),
 }
 
 impl AnyController {
@@ -112,6 +118,23 @@ impl AnyController {
 
             #[cfg(feature = "socket-tcp-bbr")]
             AnyController::Bbr(b) => b,
+
+            #[cfg(feature = "socket-tcp-brutal")]
+            AnyController::Brutal(b) => b,
+        }
+    }
+
+    /// Inject the fixed target rate (bytes/sec) into the Brutal controller.
+    /// Returns `false` (no-op) if the current controller is not Brutal, so callers
+    /// can assert the apply order is correct instead of silently failing to pace.
+    #[cfg(feature = "socket-tcp-brutal")]
+    #[inline]
+    pub fn set_brutal_rate(&mut self, bytes_per_sec: u64) -> bool {
+        if let AnyController::Brutal(b) = self {
+            b.set_rate(bytes_per_sec);
+            true
+        } else {
+            false
         }
     }
 
@@ -128,6 +151,9 @@ impl AnyController {
 
             #[cfg(feature = "socket-tcp-bbr")]
             AnyController::Bbr(b) => b,
+
+            #[cfg(feature = "socket-tcp-brutal")]
+            AnyController::Brutal(b) => b,
         }
     }
 }
