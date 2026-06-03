@@ -574,6 +574,13 @@ pub struct Socket<'a> {
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
+    /// Optional ceiling (log2 of capacity) used to pre-commit `remote_win_shift`
+    /// independent of the *initial* rx buffer size. This lets the rx buffer start
+    /// small yet still negotiate a window scale large enough to advertise a bigger
+    /// window after the buffer is grown via `set_recv_capacity`. `reset()` honors
+    /// this instead of recomputing the shift from the current capacity, so it
+    /// survives socket reuse (listen -> reset). `None` = legacy behavior.
+    win_scale_ceiling_log2: Option<usize>,
     /// The remote window size, relative to local_seq_no
     /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
     remote_win_len: usize,
@@ -670,6 +677,7 @@ impl<'a> Socket<'a> {
             remote_last_win: 0,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            win_scale_ceiling_log2: None,
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -991,7 +999,14 @@ impl<'a> Socket<'a> {
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        // Honor a pre-committed window-scale ceiling (so a small initial rx buffer
+        // that may be grown later still negotiates a usable scale), falling back to
+        // the legacy "derive from current capacity" behavior. This survives reuse
+        // (listen -> reset) because the ceiling is stored on the socket.
+        self.remote_win_shift = match self.win_scale_ceiling_log2 {
+            Some(ceiling_log2) => ceiling_log2.saturating_sub(16) as u8,
+            None => rx_cap_log2.saturating_sub(16) as u8,
+        };
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -1297,6 +1312,62 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn send_capacity(&self) -> usize {
         self.tx_buffer.capacity()
+    }
+
+    /// Pre-commit the advertised window scale as if the rx buffer capacity were
+    /// `ceiling`, while leaving the actual rx storage at its current (small) size.
+    ///
+    /// The TCP window scale is negotiated only in the SYN handshake and cannot
+    /// change mid-connection. To support starting with a tiny rx buffer and
+    /// growing it later (via [`set_recv_capacity`](#method.set_recv_capacity)),
+    /// call this *before* `listen()`/`connect()` with the maximum capacity the rx
+    /// buffer may later reach. The shift is stored on the socket so it also
+    /// survives `reset()` (socket reuse). Only affects the *granularity*/ceiling
+    /// of the advertised window; the window actually advertised is still bounded
+    /// by the live rx buffer's free space.
+    pub fn set_recv_capacity_ceiling(&mut self, ceiling: usize) {
+        let log2 = mem::size_of::<usize>() * 8 - ceiling.leading_zeros() as usize;
+        self.win_scale_ceiling_log2 = Some(log2);
+        self.remote_win_shift = log2.saturating_sub(16) as u8;
+    }
+
+    /// Grow or shrink the transmit buffer to `new_capacity`, preserving all
+    /// queued (unsent + unacked) bytes. Safe in any state.
+    ///
+    /// Returns `Err(())` if `new_capacity < send_queue()` (would drop live data)
+    /// or if the buffer storage is borrowed (not owned). Used for send-buffer
+    /// auto-tuning: the unacked window must fit in the tx buffer, so growing it
+    /// lifts the throughput cap on a bulk download.
+    #[cfg(feature = "alloc")]
+    pub fn set_send_capacity(&mut self, new_capacity: usize) -> Result<(), ()> {
+        self.tx_buffer.resize(new_capacity)
+    }
+
+    /// Grow or shrink the receive buffer to `new_capacity`, preserving all
+    /// buffered (received-but-unread) bytes.
+    ///
+    /// Only valid when the reassembly buffer is empty (no out-of-order segments
+    /// pending), otherwise returns `Err(())`; also returns `Err(())` if
+    /// `new_capacity < recv_queue()` or the storage is borrowed. The advertised
+    /// window scale is *not* changed here — pre-commit it once via
+    /// [`set_recv_capacity_ceiling`](#method.set_recv_capacity_ceiling).
+    #[cfg(feature = "alloc")]
+    pub fn set_recv_capacity(&mut self, new_capacity: usize) -> Result<(), ()> {
+        if !self.assembler.is_empty() {
+            return Err(());
+        }
+        self.rx_buffer.resize(new_capacity)
+    }
+
+    /// Fully reset the socket for reuse from a connection pool: clears the tx/rx
+    /// ring buffers, the reassembly buffer, the 4-tuple, sequence numbers and
+    /// timers, returning it to the `Closed` state. Unlike [`abort`](#method.abort)
+    /// (which only flips the state to `Closed` and leaves buffers/tuple intact),
+    /// this empties everything so a subsequent shrink of the buffers and a fresh
+    /// `listen()` start from a clean slate. A pre-committed window-scale ceiling
+    /// (see [`set_recv_capacity_ceiling`]) is preserved.
+    pub fn reset_for_reuse(&mut self) {
+        self.reset();
     }
 
     /// Check whether the receive buffer is not empty.
@@ -5105,6 +5176,19 @@ mod test {
     }
 
     #[test]
+    fn test_reset_for_reuse_suppresses_rst() {
+        // Invariant relied upon by the WG-inbound listener pool: reset_for_reuse()
+        // clears the tuple, so dispatch() early-returns and NO RST is emitted.
+        // (Contrast with test_established_abort, where abort() keeps the tuple and
+        // the next poll emits exactly one RST.) The pool must therefore abort()
+        // first, let one poll emit the RST, and only then reset_for_reuse()+shrink.
+        let mut s = socket_established();
+        s.reset_for_reuse();
+        assert_eq!(s.state, State::Closed);
+        recv_nothing!(s);
+    }
+
+    #[test]
     fn test_established_rst_bad_seq() {
         let mut s = socket_established();
         send!(
@@ -6027,6 +6111,63 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    #[test]
+    fn test_set_send_capacity_preserves_inflight_and_retransmit() {
+        let mut s = socket_established(); // tx = rx = 64
+        s.send_slice(b"abcdef").unwrap();
+        // Grow the tx buffer while the bytes are queued (before they are sent).
+        s.set_send_capacity(128).unwrap();
+        assert_eq!(s.send_capacity(), 128);
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        // Grow again while still unacked; the retransmit must reproduce the
+        // exact same bytes in order (proves resize preserved the unacked data).
+        s.set_send_capacity(256).unwrap();
+        recv!(s, time 2000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_set_send_capacity_rejects_below_queued() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        assert_eq!(s.set_send_capacity(3), Err(())); // would drop queued bytes
+        assert_eq!(s.send_capacity(), 64); // unchanged
+    }
+
+    #[test]
+    fn test_recv_capacity_ceiling_window_scale() {
+        // Small rx buffer, but pre-commit a large window-scale ceiling.
+        let mut s = socket_with_buffer_sizes(64, 64);
+        s.set_recv_capacity_ceiling(1 << 20); // 1 MiB -> log2 21 -> shift 5
+        assert_eq!(s.remote_win_shift, 5);
+        // Growing the rx storage lets us advertise a bigger window within the
+        // fixed shift (window scale cannot change mid-connection).
+        s.set_recv_capacity(1usize << 16).unwrap(); // 64 KiB live capacity
+        assert_eq!(s.recv_capacity(), 1usize << 16);
+        assert_eq!(s.scaled_window(), ((1usize << 16) >> 5) as u16); // 65536 >> 5 = 2048
+    }
+
+    #[test]
+    fn test_reset_for_reuse_preserves_ceiling() {
+        let mut s = socket_with_buffer_sizes(64, 64);
+        s.set_recv_capacity_ceiling(1 << 20);
+        assert_eq!(s.remote_win_shift, 5);
+        s.reset_for_reuse();
+        // reset must NOT recompute the shift from the small current capacity.
+        assert_eq!(s.remote_win_shift, 5);
+        assert_eq!(s.state, State::Closed);
+        assert!(s.tx_buffer.is_empty() && s.rx_buffer.is_empty());
     }
 
     #[test]

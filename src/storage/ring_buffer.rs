@@ -111,6 +111,36 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     }
 }
 
+#[cfg(feature = "alloc")]
+impl<'a> RingBuffer<'a, u8> {
+    /// Resize the backing storage to `new_capacity`, preserving the logical
+    /// contents `[0, len())` in order (linearized so `read_at` becomes 0).
+    ///
+    /// Only valid for owned (`Vec`) storage; returns `Err(())` for borrowed
+    /// storage or when `new_capacity < len()` (which would drop live data).
+    /// Used for dynamic socket-buffer auto-tuning.
+    pub fn resize(&mut self, new_capacity: usize) -> Result<(), ()> {
+        if new_capacity < self.length {
+            return Err(());
+        }
+        let cap = self.capacity();
+        let old = match &self.storage {
+            ManagedSlice::Borrowed(_) => return Err(()),
+            #[cfg(feature = "alloc")]
+            ManagedSlice::Owned(v) => v,
+        };
+        let mut fresh = alloc::vec::Vec::with_capacity(new_capacity);
+        for i in 0..self.length {
+            fresh.push(old[(self.read_at + i) % cap]);
+        }
+        fresh.resize(new_capacity, 0u8); // zero-fill the unallocated tail
+        self.storage = ManagedSlice::Owned(fresh);
+        self.read_at = 0;
+        // self.length unchanged
+        Ok(())
+    }
+}
+
 /// This is the "discrete" ring buffer interface: it operates with single elements,
 /// and boundary conditions (empty/full) are errors.
 impl<'a, T: 'a> RingBuffer<'a, T> {
@@ -410,6 +440,55 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_resize_grow_preserves_wrapped_contents() {
+        // Fill, dequeue some so read_at advances, enqueue more so contents wrap.
+        let mut ring = RingBuffer::new(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abcd"), 4);
+        assert_eq!(ring.dequeue_many(2).len(), 2); // read_at -> 2, contents "cd"
+        assert_eq!(ring.enqueue_slice(b"ef"), 2); // wraps: logical "cdef"
+        assert_eq!(ring.len(), 4);
+
+        ring.resize(8).unwrap();
+        assert_eq!(ring.capacity(), 8);
+        assert_eq!(ring.len(), 4);
+        // Logical order preserved and linearized (read_at reset to 0).
+        let mut out = [0u8; 4];
+        assert_eq!(ring.dequeue_slice(&mut out), 4);
+        assert_eq!(&out, b"cdef");
+    }
+
+    #[test]
+    fn test_resize_shrink_roundtrip() {
+        let mut ring = RingBuffer::new(vec![0u8; 16]);
+        assert_eq!(ring.enqueue_slice(b"hello"), 5);
+        ring.resize(8).unwrap(); // shrink, still >= len
+        assert_eq!(ring.capacity(), 8);
+        assert_eq!(ring.len(), 5);
+        ring.resize(32).unwrap(); // grow back
+        assert_eq!(ring.capacity(), 32);
+        let mut out = [0u8; 5];
+        assert_eq!(ring.dequeue_slice(&mut out), 5);
+        assert_eq!(&out, b"hello");
+    }
+
+    #[test]
+    fn test_resize_rejects_below_len() {
+        let mut ring = RingBuffer::new(vec![0u8; 8]);
+        assert_eq!(ring.enqueue_slice(b"abcdef"), 6);
+        assert_eq!(ring.resize(4), Err(())); // would drop live data
+        assert_eq!(ring.capacity(), 8); // unchanged
+        assert_eq!(ring.len(), 6);
+    }
+
+    #[test]
+    fn test_resize_rejects_borrowed() {
+        let mut storage = [0u8; 8];
+        let mut ring = RingBuffer::new(&mut storage[..]);
+        assert_eq!(ring.enqueue_slice(b"ab"), 2);
+        assert_eq!(ring.resize(16), Err(()));
+    }
 
     #[test]
     fn test_buffer_length_changes() {
