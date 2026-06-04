@@ -38,7 +38,6 @@ pub struct Bbr {
     // Idle restart flag: set when restarting after idle period
     // This matches Linux BBR (tcp_bbr.c:101)
     idle_restart: bool,
-    pacing_rate: u64,
     max_acked_packet_number: u64,
     max_sent_packet_number: u64,
     end_recovery_at_packet_number: u64,
@@ -92,7 +91,6 @@ impl Bbr {
             probe_rtt_last_started_at: None,
             min_rtt: Duration::ZERO,
             idle_restart: false,
-            pacing_rate: 0,
             max_acked_packet_number: 0,
             max_sent_packet_number: 0,
             end_recovery_at_packet_number: 0,
@@ -390,39 +388,6 @@ impl Bbr {
         self.min_cwnd
     }
 
-    fn calculate_pacing_rate(&mut self) {
-        let bw = self.max_bandwidth.get_estimate();
-        if bw == 0 {
-            return;
-        }
-
-        // Calculate target rate with pacing gain
-        let mut target_rate = (bw as f64 * self.pacing_gain as f64) as u64;
-
-        // Apply pacing margin: pace at ~1% below estimated bandwidth
-        // This matches Linux BBR (tcp_bbr.c:251) to reduce queue buildup at bottleneck
-        target_rate = (target_rate * (100 - BBR_PACING_MARGIN_PERCENT as u64)) / 100;
-
-        if self.is_at_full_bandwidth {
-            self.pacing_rate = target_rate;
-            return;
-        }
-
-        // Pace at the rate of initial_window / RTT as soon as RTT measurements are
-        // available.
-        if self.pacing_rate == 0 && self.min_rtt.total_micros() != 0 {
-            self.pacing_rate =
-                BandwidthEstimation::bw_from_delta(self.init_cwnd as u64, self.min_rtt)
-                    .unwrap_or(0);
-            return;
-        }
-
-        // Do not decrease the pacing rate during startup.
-        if self.pacing_rate < target_rate {
-            self.pacing_rate = target_rate;
-        }
-    }
-
     fn calculate_cwnd(&mut self, bytes_acked: usize) {
         if self.mode == Mode::ProbeRtt {
             return;
@@ -621,8 +586,10 @@ impl Bbr {
 
         self.maybe_enter_or_exit_probe_rtt(now, self.round_start, self.cwnd, self.app_limited);
 
-        // After the model is updated, recalculate the pacing rate and congestion window.
-        self.calculate_pacing_rate();
+        // After the model is updated, recalculate the congestion window.
+        // NOTE(zfc): pacing rate is intentionally NOT computed — pacing is disabled
+        // for this fork (cwnd-only / ACK-clocked; see `pacing_rate()`), so the old
+        // per-ACK `calculate_pacing_rate()` was pure dead work and is removed.
         self.calculate_cwnd(bytes_acked);
         self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, self.cwnd);
 
@@ -729,7 +696,6 @@ impl Controller for Bbr {
         // cwnd_gain × BDP probes bandwidth via the in-flight headroom, loss does not
         // shrink BtlBw) while letting smoltcp drain the whole window per poll.
         // See zfc docs/design/wireguard-inbound-throughput.md.
-        let _ = self.pacing_rate; // still computed (diagnostics); intentionally unused
         0
     }
 }
@@ -913,10 +879,6 @@ const K_PACING_GAIN: [f32; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
 const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
 const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
-
-// Pacing margin: pace at ~1% below estimated bandwidth to reduce queue buildup
-// This matches Linux BBR (tcp_bbr.c:147)
-const BBR_PACING_MARGIN_PERCENT: u8 = 1;
 
 // ACK aggregation constants
 // Gain factor for adding extra_acked to target cwnd
