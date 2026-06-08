@@ -5264,6 +5264,53 @@ mod test {
     }
 
     #[test]
+    fn test_established_options_reduce_payload_when_local_mss_limited() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        // construct socket where remote MSS is less than local MSS
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_options_reduce_payload_when_remote_mss_limited() {
+        const EFFECTIVE_MSS: usize = BASE_MSS as usize;
+
+        // construct socket where remote MSS is more than local MSS
+        let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = 9999;
+        s.remote_win_len = 9999;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
     fn test_established_fin() {
         let mut s = socket_established();
         send!(
@@ -9190,6 +9237,43 @@ mod test {
                 seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"ccc"[..],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_nagle_works_with_reduce_payload_from_options() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.set_nagle_enabled(true);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS;
+
+        // Send small segment to "arm" Nagle's
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // A full segment (once options are accounted for) should not be delayed and contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS - 12]).unwrap();
+        recv!(
+            s,
+            time 0,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
                 ..RECV_TEMPL
             }]
         );
