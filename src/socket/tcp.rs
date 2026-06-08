@@ -2496,11 +2496,15 @@ impl<'a> Socket<'a> {
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
-        // Max segment size we're able to send due to MTU limitations.
-        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        // The effective max segment size, taking into account the options and the local and remote limits.
+        let options_len = if self.tsval_generator.is_some() {
+            12
+        } else {
+            0
+        };
 
-        // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss);
+        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2819,9 +2823,11 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
-                    .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let options_len = repr.header_len() - TCP_HEADER_LEN;
+
+                let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+                let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let size = win_limit.min(effective_mss);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
@@ -9243,7 +9249,7 @@ mod test {
     }
 
     #[test]
-    fn test_nagle_works_with_reduce_payload_from_options() {
+    fn test_nagle_works_with_reduced_payload_from_options() {
         const EFFECTIVE_MSS: usize = 64;
 
         let mut s = socket_established_with_buffer_sizes(256, 64);
@@ -9270,7 +9276,7 @@ mod test {
             s,
             time 0,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &[0; EFFECTIVE_MSS - 12],
                 timestamp: Some(TcpTimestampRepr::new(1, 0)),
