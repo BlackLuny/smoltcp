@@ -1981,6 +1981,15 @@ impl<'a> Socket<'a> {
                         overlap_start - window_start,
                     )
                 } else {
+                    // Out-of-window RSTs are silently dropped, per RFC 9293
+                    // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
+                    // TIME-WAIT timer below is not refreshed. RST senders don't
+                    // need a reply to make progress.
+                    if repr.control == TcpControl::Rst {
+                        net_debug!("dropping out-of-window RST");
+                        return None;
+                    }
+
                     // If we're in the TIME-WAIT state, restart the TIME-WAIT timeout, since
                     // the remote end may not have realized we've closed the connection.
                     if self.state == State::TimeWait {
@@ -1990,14 +1999,29 @@ impl<'a> Socket<'a> {
                     // Segments carrying data are exempt from challenge ACK rate
                     // limiting: an out-of-window data segment is a retransmission
                     // whose ACK was lost, or a window probe, and per RFC 9293
-                    // (3.5.2) it must elicit an ACK so the remote can make
-                    // progress. Withholding these ACKs strands the remote in
-                    // retransmission backoff or persist state. The rate limit
-                    // exists to break ACK loops between desynced peers, and an
-                    // ACK loop cannot involve data segments: the remote paces
-                    // them with its retransmission timer, never in immediate
-                    // reply to an ACK of ours.
-                    if !repr.payload.is_empty() {
+                    // (3.10.7.4, 3.8.6.1) it should elicit an ACK so the remote
+                    // can make progress. Withholding these ACKs strands the
+                    // remote in retransmission backoff or persist state. The
+                    // rate limit exists to break ACK loops between desynced
+                    // peers, and exempting data segments cannot sustain such a
+                    // loop: the remote paces them with its retransmission and
+                    // persist timers, and the data it may send in response to a
+                    // duplicate ACK of ours (fast recovery) is bounded by its
+                    // send window, which never advances during a desync.
+                    //
+                    // The exemption covers FIN (a retransmitted final segment is
+                    // the same lost-ACK situation) but not SYN: a SYN in a
+                    // synchronized state is a challenge ACK situation (RFC 5961
+                    // 4.2), and challenge ACKs should be throttled (RFC 5961 7).
+                    // One per second is ample for a restarted peer to complete
+                    // the challenge exchange, since it retransmits its SYN on
+                    // its own timer.
+                    if !repr.payload.is_empty()
+                        && matches!(
+                            repr.control,
+                            TcpControl::None | TcpControl::Psh | TcpControl::Fin
+                        )
+                    {
                         return Some(self.ack_reply(ip_repr, repr));
                     }
 
@@ -5171,6 +5195,75 @@ mod test {
     }
 
     #[test]
+    fn test_bad_seq_rst_dropped_silently() {
+        let mut s = socket_established();
+        // Out-of-window RSTs are silently dropped, per RFC 9293 (3.10.7.4)
+        // and RFC 5961 (3.2): no challenge ACK, no state change.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+
+        // A payload doesn't make it eligible for the data segment exemption
+        // from challenge ACK rate limiting either: still no reply.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_bad_seq_syn_with_data_rate_limited() {
+        let mut s = socket_established();
+        // An out-of-window SYN carrying data must not be exempt from challenge
+        // ACK rate limiting: RFC 5961 (4.2) says challenge ACKs sent in
+        // response to SYNs should be throttled.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+
+        // The second one within the rate limit window gets no reply.
+        send!(
+            s,
+            time 100,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 1 + 256,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
     fn test_established_fin() {
         let mut s = socket_established();
         send!(
@@ -5326,12 +5419,43 @@ mod test {
     #[test]
     fn test_established_rst_bad_seq() {
         let mut s = socket_established();
+        // Out-of-window RSTs are dropped silently, per RFC 9293 (3.10.7.4)
+        // and RFC 5961 (3.2).
         send!(
             s,
             TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
                 ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        assert_eq!(s.state, State::Established);
+
+        // An in-window RST still resets the connection.
+        send!(
+            s,
+            time 2000,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1, // Correct seq
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_established_bad_seq_challenge_ack_updated() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ, // Wrong seq
+                ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
@@ -5354,16 +5478,15 @@ mod test {
             }
         );
 
-        // Send wrong rst again, check that the challenge ack is correctly updated
+        // Send the wrong seq again, check that the challenge ack is correctly updated
         // The ack number must be updated even if we don't call dispatch on the socket
         // See https://github.com/smoltcp-rs/smoltcp/issues/338
         send!(
             s,
             time 2000,
             TcpRepr {
-                control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
-                ack_number: None,
+                ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
