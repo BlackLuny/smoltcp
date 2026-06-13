@@ -25,6 +25,10 @@ pub struct Cubic {
 
     recovery_start: Option<Instant>,
     in_fast_recovery: bool,
+    // Set on RTO, cleared when new data is ACKed. While set, further RTOs
+    // are retransmissions of the same segment and must not reduce ssthresh
+    // again (RFC 5681 section 3.1).
+    in_rto_recovery: bool,
     idle_start: Option<Instant>, // RFC 9438 §4.2: when in-flight last hit 0
 }
 
@@ -42,6 +46,7 @@ impl Cubic {
 
             recovery_start: None,
             in_fast_recovery: false,
+            in_rto_recovery: false,
             idle_start: None,
         };
         cubic.recompute_k();
@@ -88,6 +93,9 @@ impl Controller for Cubic {
         if len == 0 {
             return;
         }
+
+        // New data was ACKed: a timer-based loss episode, if any, is over.
+        self.in_rto_recovery = false;
 
         // First new-data-ack exits fast recovery and deflates `cwnd`
         if self.in_fast_recovery {
@@ -212,7 +220,14 @@ impl Controller for Cubic {
     }
 
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
-        self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
+        // RFC 5681: when the retransmission timer fires for a segment that has
+        // already been retransmitted by the timer (no new data was ACKed since
+        // the previous RTO), ssthresh is held constant.
+        if !self.in_rto_recovery {
+            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
+            self.in_rto_recovery = true;
+        }
+
         self.cwnd = self.min_cwnd;
         self.cwnd_prior = in_flight;
 
@@ -426,6 +441,30 @@ mod test {
         ack(&mut cubic, MSS, Instant::from_millis(2));
         assert!(!cubic.in_fast_recovery);
         assert_eq!(cubic.window(), ssthresh);
+    }
+
+    #[test]
+    fn repeated_rto_holds_ssthresh() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = MSS * 32;
+
+        // First RTO reduces ssthresh based on the flight size.
+        cubic.on_rto(Instant::from_millis(0), MSS * 32);
+        let ssthresh = cubic.ssthresh;
+        assert_eq!(ssthresh, (32.0 * MSS as f64 * BETA_CUBIC) as usize);
+
+        // Until new data is ACKed, further RTOs are retransmissions of the
+        // same segment and must hold ssthresh constant instead of collapsing
+        // it towards the minimum.
+        cubic.on_rto(Instant::from_millis(1), MSS);
+        assert_eq!(cubic.ssthresh, ssthresh);
+
+        // Once new data is ACKed, the next RTO is a fresh loss detection
+        // and reduces ssthresh again.
+        ack(&mut cubic, MSS, Instant::from_millis(2));
+        cubic.on_rto(Instant::from_millis(3), MSS * 4);
+        assert_eq!(cubic.ssthresh, (4.0 * MSS as f64 * BETA_CUBIC) as usize);
     }
 
     #[test]
