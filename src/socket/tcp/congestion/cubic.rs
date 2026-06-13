@@ -16,10 +16,10 @@ const DEFAULT_MSS: usize = 1024;
 pub struct Cubic {
     w_max: usize, // window size prior to loss
     cwnd: usize,
-    min_cwnd: usize,
+    mss: usize,
     ssthresh: usize,
     rwnd: usize,
-    k: f64,            // cubic curve offset in seconds; depends only on w_max and min_cwnd
+    k: f64,            // cubic curve offset in seconds; depends only on w_max and mss
     w_est: f64,        // RFC 9438 §4.3 reno-friendly window, integrated per ACK
     cwnd_prior: usize, // cwnd at the most recent congestion event; gates α_cubic
 
@@ -37,7 +37,7 @@ impl Cubic {
         let mut cubic = Cubic {
             w_max: DEFAULT_MSS * 2,
             cwnd: DEFAULT_MSS * 2,
-            min_cwnd: DEFAULT_MSS * 2,
+            mss: DEFAULT_MSS,
             rwnd: 64 * DEFAULT_MSS,
             ssthresh: usize::MAX,
             k: 0.0,
@@ -55,7 +55,7 @@ impl Cubic {
 
     // K = cbrt(w_max * (1 - beta) / C) ^ 1/3
     fn recompute_k(&mut self) {
-        let c_as_bytes = C * self.min_cwnd as f64;
+        let c_as_bytes = C * self.mss as f64;
         let k3 = (self.w_max as f64) * (1.0 - BETA_CUBIC) / c_as_bytes;
         self.k = cube_root(k3);
     }
@@ -78,7 +78,7 @@ impl Controller for Cubic {
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
-        let segment = len.min(self.min_cwnd);
+        let segment = len.min(self.mss);
 
         self.absorb_idle(now);
 
@@ -109,7 +109,7 @@ impl Controller for Cubic {
                 .cwnd
                 .saturating_add(segment)
                 .min(self.rwnd)
-                .max(self.min_cwnd);
+                .max(self.mss);
             return;
         }
 
@@ -135,7 +135,7 @@ impl Controller for Cubic {
 
         // RFC 9438 §4.3: use cubic function to get suggested cwnd.
         // W_cubic(t) = C(t - K)^3 + w_max, evaluated at the current time t.
-        let c_as_bytes = C * self.min_cwnd as f64;
+        let c_as_bytes = C * self.mss as f64;
         let w_cubic = c_as_bytes * (t as f64 / 1_000_000.0 - self.k).powi(3) + self.w_max as f64;
 
         // RFC 9438 §4.3: advance our reno-like suggested cwnd.
@@ -147,13 +147,13 @@ impl Controller for Cubic {
                 ALPHA_CUBIC
             };
 
-            self.w_est += alpha * self.min_cwnd as f64 * segment as f64 / self.cwnd as f64;
+            self.w_est += alpha * self.mss as f64 * segment as f64 / self.cwnd as f64;
             self.w_est
         };
 
         // RFC 9438 §4.3: use the suggested window that grows fastest.
         if w_cubic < w_est {
-            self.cwnd = (w_est as usize).min(self.rwnd).max(self.min_cwnd);
+            self.cwnd = (w_est as usize).min(self.rwnd).max(self.mss);
             return;
         }
 
@@ -170,16 +170,12 @@ impl Controller for Cubic {
         // TODO: clamps to 0 on small w_cubic_target (i.e. close to plateau)
         // add additional counter (linux `cwnd_cnt`?) to track "lost" bytes
         let increment = (w_cubic_target as usize).saturating_sub(self.cwnd) * segment / self.cwnd;
-        self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.min_cwnd);
+        self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.mss);
     }
 
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
-            self.cwnd = self
-                .cwnd
-                .saturating_add(len)
-                .min(self.rwnd)
-                .max(self.min_cwnd);
+            self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
         }
     }
 
@@ -207,11 +203,8 @@ impl Controller for Cubic {
                 self.cwnd
             };
 
-            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
-            self.cwnd = self
-                .ssthresh
-                .min(self.rwnd)
-                .saturating_add(3 * self.min_cwnd);
+            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
+            self.cwnd = self.ssthresh.min(self.rwnd).saturating_add(3 * self.mss);
 
             self.recovery_start = Some(now);
             self.in_fast_recovery = true;
@@ -224,11 +217,11 @@ impl Controller for Cubic {
         // already been retransmitted by the timer (no new data was ACKed since
         // the previous RTO), ssthresh is held constant.
         if !self.in_rto_recovery {
-            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
+            self.ssthresh = ((in_flight as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
             self.in_rto_recovery = true;
         }
 
-        self.cwnd = self.min_cwnd;
+        self.cwnd = self.mss;
         self.cwnd_prior = in_flight;
 
         // RFC 9438 §4.8: defer W_max and K reset to the start of the next CA stage.
@@ -238,7 +231,7 @@ impl Controller for Cubic {
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss;
+        self.mss = mss;
         self.recompute_k();
     }
 
