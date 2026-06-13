@@ -13,6 +13,10 @@ pub struct Reno {
     rwnd: usize,
 
     in_fast_recovery: bool,
+    // Set on RTO, cleared when new data is ACKed. While set, further RTOs
+    // are retransmissions of the same segment and must not reduce ssthresh
+    // again (RFC 5681 section 3.1).
+    in_rto_recovery: bool,
 }
 
 impl Reno {
@@ -23,6 +27,7 @@ impl Reno {
             ssthresh: usize::MAX,
             rwnd: 64 * DEFAULT_MSS,
             in_fast_recovery: false,
+            in_rto_recovery: false,
         }
     }
 }
@@ -33,6 +38,9 @@ impl Controller for Reno {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
+        // New data was ACKed: a timer-based loss episode, if any, is over.
+        self.in_rto_recovery = false;
+
         // First new-data-ack exits fast recovery and deflates `cwnd`
         if self.in_fast_recovery {
             self.in_fast_recovery = false;
@@ -79,7 +87,15 @@ impl Controller for Reno {
     }
 
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
-        self.ssthresh = (in_flight >> 1).max(2 * self.min_cwnd);
+        // RFC 5681: when the retransmission timer fires for a segment that has
+        // already been retransmitted by the timer (no new data was ACKed since
+        // the previous RTO), ssthresh is held constant.
+        if !self.in_rto_recovery {
+            self.ssthresh = (in_flight >> 1).max(2 * self.min_cwnd);
+            self.in_rto_recovery = true;
+        }
+
+        // cwnd collapses to the loss window (1 MSS) and we re-enter slow start.
         self.cwnd = self.min_cwnd;
 
         // Major loss has occurred, ensure we move from fast recovery (if in it) to slow start.
@@ -316,6 +332,31 @@ mod test {
         ack(&mut reno, MSS, Instant::from_millis(time));
         assert!(reno.window() > initial_cwnd);
         assert!(reno.window() < initial_cwnd + MSS);
+    }
+
+    #[test]
+    fn repeated_rto_holds_ssthresh() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+        reno.cwnd = MSS * 32;
+
+        // First RTO halves ssthresh based on the flight size.
+        reno.on_rto(Instant::from_millis(0), MSS * 32);
+        assert_eq!(reno.ssthresh, MSS * 16);
+        assert_eq!(reno.window(), MSS);
+
+        // Until new data is ACKed, further RTOs are retransmissions of the
+        // same segment and must hold ssthresh constant instead of collapsing
+        // it towards the minimum.
+        reno.on_rto(Instant::from_millis(1), MSS);
+        assert_eq!(reno.ssthresh, MSS * 16);
+        assert_eq!(reno.window(), MSS);
+
+        // Once new data is ACKed, the next RTO is a fresh loss detection
+        // and reduces ssthresh again.
+        ack(&mut reno, MSS, Instant::from_millis(2));
+        reno.on_rto(Instant::from_millis(3), MSS * 4);
+        assert_eq!(reno.ssthresh, MSS * 2);
     }
 
     #[test]
