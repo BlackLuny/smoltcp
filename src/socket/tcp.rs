@@ -2869,7 +2869,16 @@ impl<'a> Socket<'a> {
 
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
-                let size = win_limit.min(effective_mss).min(self.cwnd_remaining());
+                let size = if is_zero_window_probe {
+                    // Zero-window probes are exempt from the congestion window: they
+                    // are sent precisely when normal transmission is impossible, and
+                    // an empty segment elicits no reply, so capping the probe to a
+                    // zero length would stall the connection if a window update from
+                    // the remote got lost.
+                    win_limit.min(effective_mss)
+                } else {
+                    win_limit.min(effective_mss).min(self.cwnd_remaining())
+                };
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
@@ -8447,6 +8456,60 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_zero_window_probe_not_capped_by_cwnd() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+
+        let data = [b'x'; 4096];
+        s.send_slice(&data[..]).unwrap();
+
+        // Reno's initial cwnd is 2048: two segments fill the congestion window
+        // exactly, leaving cwnd_remaining() == 0.
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // The remote closes its window without acknowledging anything new, so
+        // no congestion window space is freed either.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+
+        // Arm the probe timer. (Set directly because the ACK above carries no
+        // new data; in real traffic this state is reached e.g. when the
+        // controller shrinks cwnd below the flight size while probing.)
+        s.timer
+            .set_for_zero_window_probe(Instant::from_millis(10), Duration::from_millis(100));
+
+        // The probe must carry 1 byte of data past the window edge even though
+        // the congestion window is exhausted: an empty probe occupies no
+        // sequence space and elicits no reply, so the connection would stall
+        // if the remote's window update got lost.
+        recv!(s, time 110, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1],
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]
