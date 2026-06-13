@@ -38,6 +38,14 @@ impl Controller for Reno {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
+        // RFC 5681 only acts on ACKs of new data. The socket also notifies us
+        // of accepted segments that acknowledge nothing (window updates, data
+        // segments from the remote): those must not exit fast recovery nor
+        // grow the window.
+        if len == 0 {
+            return;
+        }
+
         // New data was ACKed: a timer-based loss episode, if any, is over.
         self.in_rto_recovery = false;
 
@@ -332,6 +340,49 @@ mod test {
         ack(&mut reno, MSS, Instant::from_millis(time));
         assert!(reno.window() > initial_cwnd);
         assert!(reno.window() < initial_cwnd + MSS);
+    }
+
+    #[test]
+    fn zero_length_ack_does_not_exit_fast_recovery() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+        reno.cwnd = MSS * 32;
+
+        reno.on_loss(Instant::from_millis(0), reno.cwnd);
+        assert!(reno.in_fast_recovery);
+
+        let cwnd = reno.window();
+        let ssthresh = reno.ssthresh;
+
+        // Accepted segments that acknowledge no new data (window updates,
+        // data segments from the remote) must not end fast recovery or
+        // change the window.
+        ack(&mut reno, 0, Instant::from_millis(1));
+        assert!(reno.in_fast_recovery);
+        assert_eq!(reno.window(), cwnd);
+        assert_eq!(reno.ssthresh, ssthresh);
+
+        // The first ACK of new data still exits and deflates.
+        ack(&mut reno, MSS, Instant::from_millis(2));
+        assert!(!reno.in_fast_recovery);
+        assert_eq!(reno.window(), ssthresh);
+    }
+
+    #[test]
+    fn zero_length_ack_does_not_grow_window() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+
+        // Slow start.
+        let cwnd = reno.window();
+        ack(&mut reno, 0, Instant::from_millis(0));
+        assert_eq!(reno.window(), cwnd);
+
+        // Congestion avoidance.
+        reno.cwnd = MSS * 32;
+        reno.ssthresh = MSS * 16;
+        ack(&mut reno, 0, Instant::from_millis(1));
+        assert_eq!(reno.window(), MSS * 32);
     }
 
     #[test]
