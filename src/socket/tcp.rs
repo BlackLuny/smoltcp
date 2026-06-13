@@ -6698,6 +6698,49 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_congestion_window_limits_data_in_flight() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+
+        let data = [b'x'; 8192];
+        s.send_slice(&data[..]).unwrap();
+
+        // Reno's initial congestion window is 2048 bytes: only two
+        // 1024-byte segments may be in flight, the rest must wait for ACKs.
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // ACKing one segment frees congestion window space and grows
+        // cwnd (slow start), allowing further segments out.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1024),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
     fn test_data_retransmit_bursts() {
         let mut s = socket_established();
         s.remote_mss = 6;
