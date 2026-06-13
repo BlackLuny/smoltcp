@@ -241,8 +241,11 @@ impl Controller for Cubic {
 /// Floats are constructed from a mantissa and expontnet component.
 /// Cbrt of a float can be achieved by cbrt of these two components.
 ///
-/// The mantissa is always between 1 and 2 so we just use the center of the cbrt range.
-/// The error here is never greater than 12%. Later iterations eliminate it.
+/// The mantissa is always between 1 and 2, putting the cbrt between 1
+/// and 1.2599. The slope of the curve between those two points is
+/// almost a straight line, so a linear interpolatoin between those
+/// two points gives an error less than 2%.
+///
 ///
 /// The exponent `e` of `2^e` has two parts, tt's quotient and remainder: `e = 3q + r`.
 /// Which means cbrt `2^e` is cbrt `2^3q * 2^r` which becomes `2^q * 2^(r/3)`.
@@ -259,11 +262,14 @@ fn cube_root(a: f64) -> f64 {
         return 0.0;
     }
 
-    const CBRT_MANTISSA: f64 = 1.1224620483093730;
-    const REM_COMPONENT: [f64; 3] = [1.0, 1.2599210498948732, 1.5874010519681994];
+    const POW2_REM_OVER_3: [f64; 3] = [1.0, 1.2599210498948732, 1.5874010519681994];
 
     // decompose a into IEEE-754 components
     let bits = a.to_bits();
+
+    // extract mantissa, get rough cbrt using linear interpolation
+    let m = f64::from_bits((bits & 0x000F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000);
+    let cbrt_m = m.mul_add(0.2599, 0.7401);
 
     // extract exponent, break into quotient and remainder
     // e = 3q + r where r ∈ {0, 1, 2}
@@ -276,15 +282,10 @@ fn cube_root(a: f64) -> f64 {
 
     // add cbrt mantissa and other component back in:
     // cbrt mantiassa * 2^q * 2^(r/3)
-    let mut x = CBRT_MANTISSA * pow2q * REM_COMPONENT[r];
+    let x = cbrt_m * pow2q * POW2_REM_OVER_3[r];
 
-    // limited iterations should bring us close enough
-    // within 3 or 4 sf in the worse-case with 12% error on start
-    for _ in 0..2 {
-        x = (2.0 * x + a / (x * x)) / 3.0;
-    }
-
-    x
+    // a single iteration should bring us close enough
+    (2.0 * x + a / (x * x)) / 3.0
 }
 
 #[cfg(test)]
