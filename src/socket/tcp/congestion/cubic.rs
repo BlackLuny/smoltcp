@@ -52,7 +52,7 @@ impl Cubic {
     fn recompute_k(&mut self) {
         let c_as_bytes = C * self.min_cwnd as f64;
         let k3 = (self.w_max as f64) * (1.0 - BETA_CUBIC) / c_as_bytes;
-        self.k = cube_root(k3).unwrap_or(0.0);
+        self.k = cube_root(k3);
     }
 
     // RFC 9438 §4.2: subtract the most recent idle period from t by sliding
@@ -254,9 +254,9 @@ impl Controller for Cubic {
 /// `cbrt(a) = cbrt(mantissa) * 2^q * 2^(r/3)`
 ///
 /// One or two Newton-Raphson iterations reduce any error enough not to matter.
-fn cube_root(a: f64) -> Option<f64> {
-    if !(a > 0.0 && a.is_finite()) {
-        return None;
+fn cube_root(a: f64) -> f64 {
+    if !(a >= f64::MIN_POSITIVE && a.is_finite()) {
+        return 0.0;
     }
 
     const CBRT_MANTISSA: f64 = 1.1224620483093730;
@@ -284,7 +284,7 @@ fn cube_root(a: f64) -> Option<f64> {
         x = (2.0 * x + a / (x * x)) / 3.0;
     }
 
-    Some(x)
+    x
 }
 
 #[cfg(test)]
@@ -548,13 +548,7 @@ mod test {
             let a = n as f64;
             let a = a * a * a;
             let result = cube_root(a);
-            println!("cube_root({a}) = {}", result.unwrap());
+            println!("cube_root({a}) = {}", result);
         }
-    }
-
-    #[test]
-    #[should_panic]
-    fn cube_root_zero() {
-        cube_root(0.0).unwrap();
     }
 }
