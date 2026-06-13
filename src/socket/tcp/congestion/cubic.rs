@@ -544,11 +544,27 @@ mod test {
 
     #[test]
     fn test_cube_root() {
-        for n in (1..1000000).step_by(99) {
-            let a = n as f64;
-            let a = a * a * a;
-            let result = cube_root(a);
-            println!("cube_root({a}) = {}", result);
+        let mut max_err = 0.0;
+        let mut max_err_at = 0;
+        let mut max_err_expected = 0.0;
+        let mut max_err_found = 0.0;
+
+        for i in (1..1_000_000).step_by(99) {
+            let found = cube_root(i as f64);
+            let expected = (i as f64).cbrt();
+            let err = (found - expected).abs() / expected;
+
+            if err > max_err {
+                max_err = err;
+                max_err_at = i;
+                max_err_found = found;
+                max_err_expected = expected;
+            }
         }
+
+        assert!(
+            max_err < 0.0005,
+            "cube_root({max_err_at}) = {max_err_found}, expected ~{max_err_expected}, rel err {max_err:.3e}"
+        );
     }
 }
