@@ -81,6 +81,14 @@ impl Controller for Cubic {
             self.idle_start = Some(now);
         }
 
+        // RFC 9438 only acts on ACKs of new data. The socket also notifies us
+        // of accepted segments that acknowledge nothing (window updates, data
+        // segments from the remote): those must not exit fast recovery nor
+        // grow the window.
+        if len == 0 {
+            return;
+        }
+
         // First new-data-ack exits fast recovery and deflates `cwnd`
         if self.in_fast_recovery {
             self.in_fast_recovery = false;
@@ -392,6 +400,32 @@ mod test {
         ack(&mut cubic, MSS, Instant::from_millis(10));
         assert_eq!(cubic.window(), cubic.ssthresh);
         assert!(!cubic.in_fast_recovery);
+    }
+
+    #[test]
+    fn zero_length_ack_does_not_exit_fast_recovery() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = MSS * 32;
+
+        cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
+        assert!(cubic.in_fast_recovery);
+
+        let cwnd = cubic.window();
+        let ssthresh = cubic.ssthresh;
+
+        // Accepted segments that acknowledge no new data (window updates,
+        // data segments from the remote) must not end fast recovery or
+        // change the window.
+        ack(&mut cubic, 0, Instant::from_millis(1));
+        assert!(cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), cwnd);
+        assert_eq!(cubic.ssthresh, ssthresh);
+
+        // The first ACK of new data still exits and deflates.
+        ack(&mut cubic, MSS, Instant::from_millis(2));
+        assert!(!cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), ssthresh);
     }
 
     #[test]
