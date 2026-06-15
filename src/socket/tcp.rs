@@ -2862,9 +2862,7 @@ impl<'a> Socket<'a> {
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
-                    let size = effective_mss
-                        .min(self.cwnd_remaining())
-                        .min(self.tx_buffer.len());
+                    let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
