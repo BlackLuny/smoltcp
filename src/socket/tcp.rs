@@ -6788,6 +6788,70 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_congestion_window_doesnt_limit_fast_retransmit() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+
+        // Normal ACK of previously received segment
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+
+        let data = [b'x'; 8192];
+        s.send_slice(&data[..]).unwrap();
+
+        // Reno's initial congestion window is 2048 bytes, allowing 2 segments
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // Send three duplicate ACKS, treating the first segment as lost
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+
+        // A fast retrnasmit should be sent and not be blocked by congestion control
+        recv!(s, time 20, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
     fn test_data_retransmit_bursts() {
         let mut s = socket_established();
         s.remote_mss = 6;
