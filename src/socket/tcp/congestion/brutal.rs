@@ -11,8 +11,8 @@ use super::Controller;
 /// Phase 1 (this impl): **no loss compensation** (`ack_rate = 1`) — `pacing_rate()`
 /// returns the raw target rate. The loss-inflation form (`rate / ack_rate`, capped
 /// ~1.25×, à la hysteria2 / TCP-Brutal) can be layered on later, once the
-/// `Controller` trait carries lost-byte signals (today `on_retransmit` /
-/// `on_duplicate_ack` carry no byte count, so a precise `ack_rate` is not derivable).
+/// `Controller` trait carries lost-byte signals (today `on_loss` / `on_dup_ack` /
+/// `on_rto` carry no lost-byte count, so a precise `ack_rate` is not derivable).
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Brutal {
@@ -72,7 +72,7 @@ impl Controller for Brutal {
         usize::try_from(win).unwrap_or(usize::MAX).max(floor)
     }
 
-    fn on_ack(&mut self, _now: Instant, _len: usize, rtt: &RttEstimator) {
+    fn on_ack(&mut self, _now: Instant, _len: usize, _in_flight: usize, rtt: &RttEstimator) {
         // Track RTT for BDP sizing. (Loss is intentionally not tracked in phase 1.)
         if let Some(srtt) = rtt.smoothed_rtt_opt() {
             self.rtt = srtt;

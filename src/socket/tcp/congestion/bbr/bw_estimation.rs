@@ -15,6 +15,11 @@ pub(crate) struct BandwidthEstimation {
     prev_sent_time: Option<Instant>,
     max_filter: MinMax,
     acked_at_last_window: u64,
+    /// NOTE(zfc): start of the current delivery-rate sampling interval
+    /// (timestamp, `total_acked` at that time).
+    interval_start: Option<(Instant, u64)>,
+    /// NOTE(zfc): minimum sampling interval (≈ min RTT, floored to 1 ms).
+    sample_interval: Duration,
 }
 
 impl Default for BandwidthEstimation {
@@ -30,9 +35,15 @@ impl Default for BandwidthEstimation {
             prev_sent_time: None,
             max_filter: MinMax::new(10),
             acked_at_last_window: 0,
+            interval_start: None,
+            sample_interval: MIN_SAMPLE_INTERVAL,
         }
     }
 }
+
+/// Floor for the sampling interval: `now` has millisecond-ish effective resolution
+/// on the host timer, and a sub-RTT LAN path would otherwise sample per batch.
+const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(1);
 
 impl BandwidthEstimation {
     pub fn on_sent(&mut self, now: Instant, bytes: u64) {
@@ -42,6 +53,19 @@ impl BandwidthEstimation {
         self.sent_time = Some(now);
     }
 
+    /// NOTE(zfc): set the delivery-rate sampling interval (the BBR min RTT).
+    pub fn set_sample_interval(&mut self, min_rtt: Duration) {
+        self.sample_interval = min_rtt.max(MIN_SAMPLE_INTERVAL);
+    }
+
+    /// NOTE(zfc): delivery rate is sampled over an interval of at least one min RTT
+    /// (bytes ACKed during the interval / elapsed time), not per ACK. The host
+    /// netstack stamps a whole batch of received segments with a single `now`, so a
+    /// per-ACK rate (one ACK's bytes over the gap since the previous ACK) reads 0 for
+    /// every ACK in a batch but the first, and the first one divides a single ACK's
+    /// bytes by the whole inter-batch gap — BtlBw collapses to a small fraction of
+    /// the real rate. That was harmless while the socket ignored cwnd, but with cwnd
+    /// enforced (#637) it pins throughput to that underestimate.
     pub fn on_ack(
         &mut self,
         now: Instant,
@@ -50,41 +74,35 @@ impl BandwidthEstimation {
         round: u64,
         app_limited: bool,
     ) {
+        let acked_before = self.total_acked;
         self.prev_total_acked = self.total_acked;
         self.total_acked += bytes;
         self.prev_acked_time = self.acked_time;
         self.acked_time = Some(now);
 
-        if self.prev_sent_time.is_none() {
+        let (start, start_acked) = match self.interval_start {
+            Some(s) => s,
+            None => {
+                self.interval_start = Some((now, acked_before));
+                return;
+            }
+        };
+        if now < start {
+            self.interval_start = Some((now, acked_before));
             return;
         }
-
-        let send_rate = if self.sent_time.unwrap() > self.prev_sent_time.unwrap() {
-            BandwidthEstimation::bw_from_delta(
-                self.total_sent - self.prev_total_sent,
-                self.sent_time.unwrap() - self.prev_sent_time.unwrap(),
-            )
-            .unwrap_or(0)
-        } else {
-            u64::MAX // will take the min of send and ack, so this is just a skip
+        let elapsed = now - start;
+        if elapsed < self.sample_interval {
+            return;
+        }
+        let Some(bandwidth) =
+            BandwidthEstimation::bw_from_delta(self.total_acked - start_acked, elapsed)
+        else {
+            return;
         };
-
-        let ack_rate = if let Some(prev_acked_time) = self.prev_acked_time {
-            if self.acked_time.unwrap() > prev_acked_time {
-                BandwidthEstimation::bw_from_delta(
-                    self.total_acked - self.prev_total_acked,
-                    self.acked_time.unwrap() - prev_acked_time,
-                )
-                .unwrap_or(0)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        self.interval_start = Some((now, self.total_acked));
+        // Linux `bbr_update_bw`: app-limited samples only count if they raise the max.
+        if !app_limited || bandwidth >= self.max_filter.get() {
             self.max_filter.update_max(round, bandwidth);
         }
     }

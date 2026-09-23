@@ -32,6 +32,11 @@ pub struct Bbr {
     init_cwnd: usize,
     min_cwnd: usize,
     prev_in_flight_count: usize,
+    /// NOTE(zfc): bytes in flight after the ACK being processed, as reported by the
+    /// socket. The original port approximated in-flight with `cwnd` everywhere; with
+    /// cwnd actually enforced (#637) that approximation can never drop below the
+    /// ProbeRTT target, so ProbeRTT never exits and BtlBw decays to the floor.
+    bytes_in_flight: usize,
     exit_probe_rtt_at: Option<Instant>,
     probe_rtt_last_started_at: Option<Instant>,
     min_rtt: Duration,
@@ -87,6 +92,7 @@ impl Bbr {
             init_cwnd: initial_window,
             min_cwnd: min_window,
             prev_in_flight_count: 0,
+            bytes_in_flight: 0,
             exit_probe_rtt_at: None,
             probe_rtt_last_started_at: None,
             min_rtt: Duration::ZERO,
@@ -186,7 +192,7 @@ impl Bbr {
             // Starting 1st round of Recovery, so do packet conservation.
             self.packet_conservation = true;
             // Start new round now
-            self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+            self.current_round_trip_end_packet_number = self.round_end_mark();
             // Cut unused cwnd from app behavior or other factors
             cwnd = bytes_in_flight.saturating_add(bytes_acked);
         }
@@ -214,7 +220,7 @@ impl Bbr {
     fn update_recovery_state(&mut self, is_round_start: bool) {
         // Exit recovery when there are no losses for a round.
         if self.loss_state.has_losses() {
-            self.end_recovery_at_packet_number = self.max_sent_packet_number;
+            self.end_recovery_at_packet_number = self.round_end_mark();
         }
         match self.recovery_state {
             // Enter conservation on the first loss.
@@ -227,7 +233,7 @@ impl Bbr {
                 self.recovery_window = 0;
                 // Since the conservation phase is meant to be lasting for a whole
                 // round, extend the current round as if it were started right now.
-                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+                self.current_round_trip_end_packet_number = self.round_end_mark();
             }
             RecoveryState::Growth | RecoveryState::Conservation => {
                 if self.recovery_state == RecoveryState::Conservation && is_round_start {
@@ -370,7 +376,10 @@ impl Bbr {
 
     fn get_target_cwnd(&self, gain: f32) -> usize {
         let bw = self.max_bandwidth.get_estimate();
-        let bdp = self.min_rtt.total_micros() * bw;
+        // NOTE(zfc): RTT samples are whole milliseconds, so a sub-ms LAN path reads
+        // min_rtt = 0 and the BDP would vanish; floor it at 1 ms.
+        let min_rtt_us = self.min_rtt.total_micros().max(1_000);
+        let bdp = min_rtt_us * bw;
         let bdpf = bdp as f64;
         let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as usize;
         // BDP estimate will be zero if no bandwidth samples are available yet.
@@ -408,7 +417,7 @@ impl Bbr {
         if let Some(new_cwnd) = self.set_cwnd_to_recover_or_restore(
             bytes_acked,
             self.loss_state.lost_bytes,
-            self.cwnd, // Use current cwnd as bytes_in_flight approximation
+            self.bytes_in_flight,
         ) {
             self.cwnd = new_cwnd;
             // If packet conservation is active, skip normal cwnd growth
@@ -524,11 +533,17 @@ impl Bbr {
 
     fn on_ack_impl(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
         let bytes = len as u64;
-        // Simulate packet numbers using bytes
-        let packet_number = self.max_acked_packet_number + 1;
-        self.max_acked_packet_number = packet_number;
+        // NOTE(zfc): round / recovery accounting is in ACKed *bytes* against a
+        // target of "everything in flight when the round started has been ACKed"
+        // (`round_end_mark`). The original port counted `on_ack` and
+        // `post_transmit` calls as packet numbers; one ACK routinely covers several
+        // segments (delayed / cumulative ACKs) and retransmits add sends, so the
+        // ACK count drifts ever further behind the send count and rounds stop
+        // ending — ProbeRTT never exits, the BtlBw filter window never advances.
+        self.max_acked_packet_number = self.max_acked_packet_number.saturating_add(bytes);
 
         // Update bandwidth estimation with app_limited state
+        self.max_bandwidth.set_sample_interval(rtt.min_rtt());
         self.max_bandwidth
             .on_ack(now, now, bytes, self.round_count, self.app_limited);
         self.acked_bytes += bytes;
@@ -551,10 +566,10 @@ impl Bbr {
         self.round_start = false;
         if bytes_acked > 0 {
             let is_round_start =
-                self.max_acked_packet_number > self.current_round_trip_end_packet_number;
+                self.max_acked_packet_number >= self.current_round_trip_end_packet_number;
             if is_round_start {
                 self.round_start = true;
-                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+                self.current_round_trip_end_packet_number = self.round_end_mark();
                 self.round_count += 1;
                 // Reset packet conservation on round start
                 // Matches tcp_bbr.c:776
@@ -575,23 +590,32 @@ impl Bbr {
         );
 
         if self.mode == Mode::ProbeBw {
-            self.update_gain_cycle_phase(now, self.cwnd);
+            self.update_gain_cycle_phase(now, self.bytes_in_flight);
         }
 
         if self.round_start && !self.is_at_full_bandwidth {
             self.check_if_full_bw_reached();
         }
 
-        self.maybe_exit_startup_or_drain(now, self.cwnd);
+        self.maybe_exit_startup_or_drain(now, self.bytes_in_flight);
 
-        self.maybe_enter_or_exit_probe_rtt(now, self.round_start, self.cwnd, self.app_limited);
+        self.maybe_enter_or_exit_probe_rtt(
+            now,
+            self.round_start,
+            self.bytes_in_flight,
+            self.app_limited,
+        );
 
         // After the model is updated, recalculate the congestion window.
         // NOTE(zfc): pacing rate is intentionally NOT computed — pacing is disabled
         // for this fork (cwnd-only / ACK-clocked; see `pacing_rate()`), so the old
         // per-ACK `calculate_pacing_rate()` was pure dead work and is removed.
         self.calculate_cwnd(bytes_acked);
-        self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, self.cwnd);
+        self.calculate_recovery_window(
+            bytes_acked,
+            self.loss_state.lost_bytes,
+            self.bytes_in_flight,
+        );
 
         // Reset idle_restart after processing new data delivery
         // Matches tcp_bbr.c:983-984: "Restart after idle ends only once we process a new S/ACK for data"
@@ -599,8 +623,14 @@ impl Bbr {
             self.idle_restart = false;
         }
 
-        self.prev_in_flight_count = self.cwnd;
+        self.prev_in_flight_count = self.bytes_in_flight;
         self.loss_state.reset();
+    }
+
+    /// ACKed-bytes mark at which everything currently in flight has been ACKed.
+    fn round_end_mark(&self) -> u64 {
+        self.max_acked_packet_number
+            .saturating_add(self.bytes_in_flight as u64)
     }
 
     fn on_transmit_impl(&mut self, now: Instant, len: usize) {
@@ -622,8 +652,10 @@ impl Controller for Bbr {
         // relies on ProbeRTT/BtlBw, not loss, for sizing. Use the BBR target cwnd
         // directly so loss tolerance actually works. See zfc
         // docs/design/wireguard-inbound-throughput.md.
+        // ProbeRTT only ever lowers the window (Linux `bbr_set_cwnd`: `min(cwnd,
+        // bbr_cwnd_min_target)`), so an RTO collapse is not bypassed while probing.
         let cwnd = if self.mode == Mode::ProbeRtt {
-            self.get_probe_rtt_cwnd()
+            self.get_probe_rtt_cwnd().min(self.cwnd)
         } else {
             self.cwnd
         };
@@ -636,16 +668,36 @@ impl Controller for Bbr {
         }
     }
 
-    fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
+    fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
+        self.bytes_in_flight = in_flight;
         self.on_ack_impl(now, len, rtt);
     }
 
-    fn on_retransmit(&mut self, _now: Instant) {
+    // NOTE(zfc): fast-retransmit loss (3 dup-ACKs) and each further dup-ACK keep the
+    // fork's loss-tolerant semantics: they only feed the recovery-state machine, the
+    // BBR target cwnd is not cut (see `window()`).
+    fn on_loss(&mut self, _now: Instant, _in_flight: usize) {
         self.loss_state.lost_bytes = self.loss_state.lost_bytes.saturating_add(1);
     }
 
-    fn on_duplicate_ack(&mut self, _now: Instant) {
+    fn on_dup_ack(&mut self, _now: Instant, _len: usize, _in_flight: usize) {
         self.loss_state.lost_bytes = self.loss_state.lost_bytes.saturating_add(1);
+    }
+
+    /// NOTE(zfc): a retransmission timeout means the ACK clock is gone and every
+    /// outstanding byte is presumed lost; the socket rewinds and resends from
+    /// `snd_una`. Loss tolerance must not extend to this case: resending the whole
+    /// (unpaced) window in one go into a congested bottleneck re-creates the loss
+    /// that caused the timeout (#637). Collapse to the minimum window and let
+    /// `calculate_cwnd` slow-start back toward the BBR target on returning ACKs
+    /// (Linux: `tcp_enter_loss` sets cwnd to in-flight + 1). The pre-RTO cwnd is
+    /// deliberately not restored on recovery exit: without pacing that restore is
+    /// itself a line-rate burst of up to cwnd_gain × BDP.
+    fn on_rto(&mut self, _now: Instant, _in_flight: usize) {
+        self.loss_state.lost_bytes = self.loss_state.lost_bytes.saturating_add(1);
+        self.cwnd = self.min_cwnd;
+        self.prior_cwnd = self.min_cwnd;
+        self.packet_conservation = false;
     }
 
     fn pre_transmit(&mut self, _now: Instant) {
@@ -686,16 +738,17 @@ impl Controller for Bbr {
         // NOTE(zfc): fine-grained pacing is DISABLED for this fork (return 0 →
         // tcp.rs treats the socket as cwnd-only / ACK-clocked).
         //
-        // BBR's pacing assumes a sub-millisecond timer (Linux pairs it with the fq
-        // qdisc). Here the netstack runs on a tokio loop whose `sleep` granularity is
-        // ~1ms — far coarser than the per-packet pacing interval at high rates. With
-        // pacing on, a single flow emits only ~one small burst per wake, so the BBR
-        // delivery-rate sample never exceeds that, BtlBw stalls low, and pacing locks
-        // the flow at ~cwnd-headroom/wake (~20Mbps @ ~40ms RTT) even though cwnd is
-        // wide open. cwnd-only BBR keeps the loss tolerance we actually want (cwnd =
-        // cwnd_gain × BDP probes bandwidth via the in-flight headroom, loss does not
-        // shrink BtlBw) while letting smoltcp drain the whole window per poll.
-        // See zfc docs/design/wireguard-inbound-throughput.md.
+        // The netstack runs on a tokio loop whose wakes are ~1 ms at best and several
+        // ms apart on a busy single-core worker, while the socket only lets pacing
+        // catch up `pacing_max_backlog_us` (2 ms) per wake. A paced flow therefore
+        // sends well below its pacing rate, the delivery-rate samples follow it down
+        // and BtlBw decays. #637 re-measured it with the fixed estimator (netem rig,
+        // 1-vCPU worker): pacing cut the loss storm on a 450 Mbit / 200 KB bottleneck
+        // (80 ms: 62 → 110 Mbps) but halved loss-free throughput at 80 ms (~570 →
+        // ~240 Mbps) and cost ~17% at 12 ms — a net loss. cwnd_gain × BDP still
+        // probes bandwidth through the in-flight headroom, and SACK recovery absorbs
+        // the resulting losses. See zfc docs/design/wireguard-inbound-throughput.md
+        // and Gitea #637.
         0
     }
 }
@@ -902,3 +955,137 @@ const MAX_SEGMENT_SIZE: usize = 1460;
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
 
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const MSS: usize = 1400;
+
+    fn rtte() -> RttEstimator {
+        RttEstimator::default()
+    }
+
+    #[test]
+    fn rto_collapses_window_to_min() {
+        let mut bbr = Bbr::new();
+        bbr.set_mss(MSS);
+        bbr.set_remote_window(64 * 1024 * 1024);
+        bbr.cwnd = 4 * 1024 * 1024;
+        assert_eq!(bbr.window(), 4 * 1024 * 1024);
+
+        bbr.on_rto(Instant::from_millis(1000), 4 * 1024 * 1024);
+        assert_eq!(bbr.window(), 2 * MSS, "RTO must collapse cwnd to the minimum window");
+    }
+
+    /// Drive `rounds` RTTs of an ACK clock: each RTT the whole current window is
+    /// ACKed in MSS-sized ACKs that all carry the same timestamp (the host netstack
+    /// stamps a batch of received segments with one `now`).
+    fn ack_clock(bbr: &mut Bbr, rtt: &mut RttEstimator, start_ms: i64, rtt_ms: i64, rounds: i64) -> Vec<usize> {
+        let mut windows = std::vec::Vec::new();
+        for r in 0..rounds {
+            let now = Instant::from_millis(start_ms + rtt_ms * (r + 1));
+            rtt.sample(rtt_ms as u32, now);
+            let n = (bbr.window() / MSS).max(1);
+            for _ in 0..n {
+                bbr.post_transmit(now, MSS);
+            }
+            for _ in 0..n {
+                bbr.on_ack(now, MSS, 0, rtt);
+            }
+            windows.push(bbr.window());
+        }
+        windows
+    }
+
+    #[test]
+    fn rto_window_regrows_on_acks_without_jumping_back() {
+        let mut bbr = Bbr::new();
+        bbr.set_mss(MSS);
+        bbr.set_remote_window(64 * 1024 * 1024);
+        bbr.cwnd = 4 * 1024 * 1024;
+        bbr.on_rto(Instant::from_millis(1000), 4 * 1024 * 1024);
+
+        let mut rtt = rtte();
+        let mut prev = bbr.window();
+        for w in ack_clock(&mut bbr, &mut rtt, 1000, 10, 40) {
+            // ACK-clocked regrowth: at most doubling per RTT (every acked byte may be
+            // sent twice), never a jump back to the pre-RTO window.
+            assert!(w <= prev * 2 + MSS, "window jumped ({prev} -> {w})");
+            prev = w;
+        }
+        assert!(prev >= 256 * 1024, "window must re-grow after RTO, got {prev}");
+    }
+
+    #[test]
+    fn bandwidth_estimate_survives_batched_acks() {
+        // 100 MSS ACKed per 10 ms RTT, all ACKs of an RTT sharing one timestamp:
+        // delivery rate = 100 * 1400 B / 10 ms = 14 MB/s.
+        let mut bbr = Bbr::new();
+        bbr.set_mss(MSS);
+        bbr.set_remote_window(64 * 1024 * 1024);
+        let mut rtt = rtte();
+        for r in 0..20i64 {
+            let now = Instant::from_millis(1000 + 10 * (r + 1));
+            rtt.sample(10, now);
+            for _ in 0..100 {
+                bbr.post_transmit(now, MSS);
+            }
+            for _ in 0..100 {
+                bbr.on_ack(now, MSS, 0, &rtt);
+            }
+        }
+        let bw = bbr.max_bandwidth.get_estimate();
+        let want = 100 * MSS as u64 * 100; // bytes per second
+        assert!(bw >= want * 8 / 10 && bw <= want * 12 / 10, "bw estimate {bw}, want ~{want}");
+    }
+
+    /// Fixed-capacity, ACK-clocked pipe: the sender tops in-flight up to the window,
+    /// the pipe delivers at most `cap` bytes per RTT (the rest stays queued), and the
+    /// ACKs of one RTT share a timestamp and report the real remaining in-flight.
+    fn pipe(bbr: &mut Bbr, rtt: &mut RttEstimator, rtt_ms: i64, cap: usize, rounds: i64) {
+        let mut in_flight = 0usize;
+        for r in 0..rounds {
+            let now = Instant::from_millis(1000 + rtt_ms * (r + 1));
+            rtt.sample(rtt_ms as u32, now);
+            while in_flight + MSS <= bbr.window().max(MSS) {
+                bbr.post_transmit(now, MSS);
+                in_flight += MSS;
+            }
+            // Delayed ACKs: one ACK per two segments.
+            let mut delivered = 0;
+            while delivered + 2 * MSS <= cap && in_flight >= 2 * MSS {
+                delivered += 2 * MSS;
+                in_flight -= 2 * MSS;
+                bbr.on_ack(now, 2 * MSS, in_flight, rtt);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rtt_exits_and_window_tracks_bdp() {
+        // 100 MSS per 10 ms RTT (14 MB/s); 30 s covers several 10 s ProbeRTT cycles.
+        let cap = 100 * MSS;
+        let mut bbr = Bbr::new();
+        bbr.set_mss(MSS);
+        bbr.set_remote_window(64 * 1024 * 1024);
+        let mut rtt = rtte();
+        pipe(&mut bbr, &mut rtt, 10, cap, 3000);
+        assert_ne!(bbr.mode, Mode::ProbeRtt, "stuck in ProbeRTT");
+        let bw = bbr.max_bandwidth.get_estimate();
+        let want = cap as u64 * 100;
+        assert!(bw >= want * 8 / 10, "BtlBw decayed: {bw}, want ~{want}");
+        assert!(bbr.window() >= cap, "window below BDP: {} < {cap}", bbr.window());
+    }
+
+    #[test]
+    fn fast_retransmit_loss_keeps_window() {
+        let mut bbr = Bbr::new();
+        bbr.set_mss(MSS);
+        bbr.set_remote_window(64 * 1024 * 1024);
+        bbr.cwnd = 4 * 1024 * 1024;
+        bbr.on_loss(Instant::from_millis(1000), 4 * 1024 * 1024);
+        bbr.on_dup_ack(Instant::from_millis(1000), MSS, 4 * 1024 * 1024);
+        assert_eq!(bbr.window(), 4 * 1024 * 1024, "BBR stays loss-tolerant on dup-ACK loss");
+    }
+}
