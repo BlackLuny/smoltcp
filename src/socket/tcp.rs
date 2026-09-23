@@ -3042,6 +3042,14 @@ impl<'a> Socket<'a> {
             self.hop_limit.unwrap_or(64),
         );
 
+        // Commit repair progress only once the device accepts the packet.
+        // A full device queue must not turn an unsent repair into in-flight data.
+        enum Repair {
+            Fast(TcpSeqNumber),
+            Sack(TcpSeqNumber),
+        }
+        let mut repair = None;
+
         // Construct the basic TCP representation, an empty ACK packet.
         // We'll adjust this to be more specific as needed.
         let mut repr = TcpRepr {
@@ -3120,8 +3128,8 @@ impl<'a> Socket<'a> {
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
-                    self.pending_fast_retransmit = false;
-                    self.rtx_next = self.rtx_next.max(self.local_seq_no + repr.payload.len());
+                    repair = Some(Repair::Fast(
+                        self.rtx_next.max(self.local_seq_no + repr.payload.len())));
 
                     0
                 } else if let Some((hole_start, hole_end)) = sack_hole {
@@ -3132,10 +3140,7 @@ impl<'a> Socket<'a> {
                     let offset = hole_start - self.local_seq_no;
                     repr.seq_number = hole_start;
                     repr.payload = self.tx_buffer.get_allocated(offset, size);
-                    self.rtx_next = hole_start + repr.payload.len();
-                    // Karn: an RTT sample spanning a retransmission is bogus.
-                    self.rtte.on_retransmit();
-                    self.loss_stats.sack_retransmit += 1;
+                    repair = Some(Repair::Sack(hole_start + repr.payload.len()));
                     offset
                 } else {
                     // Right edge of window, ie the max sequence number we're allowed to send.
@@ -3250,6 +3255,20 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, (ip_repr, repr))?;
+
+        match repair {
+            Some(Repair::Fast(next)) => {
+                self.pending_fast_retransmit = false;
+                self.rtx_next = next;
+            }
+            Some(Repair::Sack(next)) => {
+                self.rtx_next = next;
+                // Karn: an RTT sample spanning a retransmission is bogus.
+                self.rtte.on_retransmit();
+                self.loss_stats.sack_retransmit += 1;
+            }
+            None => {}
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -7723,6 +7742,51 @@ mod test {
         });
         assert_eq!(s.recovery_point, None);
         assert!(s.sack_board.is_empty());
+    }
+
+    #[test]
+    fn fast_retransmit_retries_after_device_backpressure() {
+        let mut s = sack_two_holes_after_dup_acks();
+        s.cx.set_now(Instant::from_millis(1070));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
+            assert_eq!(tcp.payload, b"aaa");
+            Err::<(), ()>(())
+        }), Err(()));
+        assert!(s.pending_fast_retransmit, "failed emit must retain the fast repair");
+        assert_eq!(s.rtx_next, LOCAL_SEQ + 1);
+        recv!(s, time 1071, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn sack_retransmit_retries_after_device_backpressure() {
+        let mut s = sack_two_holes_after_dup_acks();
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        let next = s.rtx_next;
+        let stats = s.loss_stats();
+        s.cx.set_now(Instant::from_millis(1071));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
+            assert_eq!(tcp.payload, b"ccc");
+            Err::<(), ()>(())
+        }), Err(()));
+        assert_eq!(s.rtx_next, next, "failed emit must not skip a SACK hole");
+        assert_eq!(s.loss_stats(), stats, "failed emit is not a retransmitted segment");
+        recv!(s, time 1072, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.loss_stats().sack_retransmit, stats.sack_retransmit + 1);
     }
 
     #[test]
