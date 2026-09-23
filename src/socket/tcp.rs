@@ -18,6 +18,7 @@ use crate::wire::{
 };
 
 mod congestion;
+mod sack;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -552,6 +553,27 @@ pub enum CongestionControl {
     Brutal,
 }
 
+/// NOTE(zfc): cumulative loss-recovery counters of one connection (diagnostics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LossStats {
+    /// Retransmission timeouts.
+    pub rto: u32,
+    /// Fast-recovery entries (third duplicate ACK).
+    pub fast_retransmit: u32,
+    /// Segments retransmitted from SACK-identified holes.
+    pub sack_retransmit: u32,
+    /// NewReno partial-ACK retransmissions.
+    pub partial_ack_retransmit: u32,
+    /// Hole-repair passes restarted because retransmissions were lost again.
+    pub lost_retransmit_rescan: u32,
+    /// RTOs without progress that dropped the SACK scoreboard (reneging guard).
+    pub sack_reneging_fallback: u32,
+    /// Fast-recovery entries triggered by SACKed data (RFC 6675) rather than
+    /// by three duplicate ACKs.
+    pub sack_triggered_recovery: u32,
+}
+
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -622,6 +644,30 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// NOTE(zfc): NewReno (RFC 6582) recovery point — the highest sequence number
+    /// sent when fast recovery was entered. While set, a partial ACK (below it)
+    /// immediately retransmits the next hole instead of waiting for three more
+    /// duplicate ACKs or, far more often with several losses per window, an RTO.
+    recovery_point: Option<TcpSeqNumber>,
+    /// NOTE(zfc): ranges the peer has SACKed above `snd_una` (see [`sack`]).
+    sack_board: sack::SackBoard,
+    /// NOTE(zfc): next sequence number to consider for a SACK-hole retransmission
+    /// in the current recovery episode (RFC 6675 "HighRxt").
+    rtx_next: TcpSeqNumber,
+    /// NOTE(zfc): recovery was entered by an RTO: every un-SACKed byte below
+    /// `recovery_point` is presumed lost (not only the holes below the highest SACK).
+    rto_recovery: bool,
+    /// NOTE(zfc): send frontier (`remote_last_seq`) when the current hole-repair
+    /// pass started. Once the peer SACKs data above it, every hole this pass already
+    /// retransmitted that is still missing was lost again: start another pass
+    /// instead of waiting for an RTO (a RACK-like lost-retransmission check).
+    rtx_pass_frontier: TcpSeqNumber,
+    /// NOTE(zfc): `snd_una` at the last RTO. A second RTO without any progress
+    /// since is treated as SACK reneging (RFC 2018 §8): the scoreboard is dropped
+    /// and everything is resent, so reneged data can never be skipped forever.
+    rto_una: Option<TcpSeqNumber>,
+    /// NOTE(zfc): cumulative loss-recovery counters for diagnostics.
+    loss_stats: LossStats,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -676,6 +722,21 @@ const DEFAULT_MSS: usize = 536;
 /// timestamps) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
 
+/// NOTE(zfc): effective MSS as computed in `seq_to_transmit` (MTU, peer MSS, options).
+fn effective_mss_for(cx: &mut Context, s: &Socket) -> usize {
+    let ip_header_len = match s.tuple.map(|t| t.local.addr) {
+        #[cfg(feature = "proto-ipv4")]
+        Some(IpAddress::Ipv4(_)) => crate::wire::IPV4_HEADER_LEN,
+        #[cfg(feature = "proto-ipv6")]
+        Some(IpAddress::Ipv6(_)) => crate::wire::IPV6_HEADER_LEN,
+        #[allow(unreachable_patterns)]
+        _ => return s.remote_mss,
+    };
+    let options_len = if s.tsval_generator.is_some() { 12 } else { 0 };
+    let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+    local_mss.min(s.remote_mss).saturating_sub(options_len)
+}
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -725,6 +786,13 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            recovery_point: None,
+            sack_board: sack::SackBoard::default(),
+            rtx_next: TcpSeqNumber::default(),
+            rto_recovery: false,
+            rtx_pass_frontier: TcpSeqNumber::default(),
+            rto_una: None,
+            loss_stats: LossStats::default(),
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -1082,6 +1150,17 @@ impl<'a> Socket<'a> {
         };
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        // NOTE(zfc): loss-recovery state must not leak into a reused socket.
+        self.local_rx_last_ack = None;
+        self.local_rx_dup_acks = 0;
+        self.pending_fast_retransmit = false;
+        self.recovery_point = None;
+        self.sack_board.clear();
+        self.rtx_next = TcpSeqNumber::default();
+        self.rto_recovery = false;
+        self.rtx_pass_frontier = TcpSeqNumber::default();
+        self.rto_una = None;
+        self.loss_stats = LossStats::default();
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
         // Clear any pacing deadline left by a previous connection. With Brutal this
@@ -1622,16 +1701,89 @@ impl<'a> Socket<'a> {
         self.congestion_controller.inner().window()
     }
 
+    /// NOTE(zfc) diagnostic: cumulative loss-recovery counters.
+    pub fn loss_stats(&self) -> LossStats {
+        self.loss_stats
+    }
+
+    /// NOTE(zfc) diagnostic: current retransmission timeout.
+    pub fn retransmission_timeout(&self) -> Duration {
+        self.rtte.retransmission_timeout()
+    }
+
+    /// NOTE(zfc) diagnostic: octets the peer has SACKed above `snd_una`.
+    pub fn sacked_octets(&self) -> usize {
+        self.sack_board.sacked_bytes()
+    }
+
+    /// NOTE(zfc) diagnostic: whether loss recovery (fast or RTO) is in progress.
+    pub fn in_loss_recovery(&self) -> bool {
+        self.recovery_point.is_some()
+    }
+
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
+    }
+
+    /// NOTE(zfc): upper bound of the data presumed lost in the current recovery
+    /// episode: the highest SACKed byte for fast recovery, the send frontier at
+    /// the time of the RTO for RTO recovery.
+    fn loss_limit(&self) -> Option<TcpSeqNumber> {
+        let recovery_point = self.recovery_point?;
+        let limit = if self.rto_recovery {
+            recovery_point
+        } else {
+            self.sack_board.highest()?.min(recovery_point)
+        };
+        Some(limit.min(self.local_seq_no + self.tx_buffer.len()))
+    }
+
+    /// NOTE(zfc): octets estimated to be in the network (RFC 6675 "pipe"): in
+    /// flight, minus what the peer has SACKed, minus what is presumed lost and has
+    /// not been retransmitted yet. Leaving the lost-not-retransmitted bytes in would
+    /// deadlock RTO recovery: the controller collapses cwnd, the un-SACKed holes
+    /// alone exceed it, and no hole can ever be retransmitted.
+    fn pipe(&self) -> usize {
+        let mut pipe = self
+            .flight_size()
+            .saturating_sub(self.sack_board.sacked_bytes());
+        if let Some(limit) = self.loss_limit() {
+            let from = self.rtx_next.max(self.local_seq_no);
+            if limit > from {
+                let lost = (limit - from) - self.sack_board.sacked_in(from, limit);
+                pipe = pipe.saturating_sub(lost);
+            }
+        }
+        pipe
     }
 
     fn cwnd_remaining(&self) -> usize {
         self.congestion_controller
             .inner()
             .window()
-            .saturating_sub(self.flight_size())
+            .saturating_sub(self.pipe())
+    }
+
+    /// NOTE(zfc): the next hole to retransmit in the current recovery episode:
+    /// un-SACKed data below the highest SACKed byte (or, after an RTO, below the
+    /// send frontier at the time of the RTO), at or above `rtx_next`.
+    fn sack_rtx_candidate(&self) -> Option<(TcpSeqNumber, TcpSeqNumber)> {
+        let limit = self.loss_limit()?;
+        self.sack_board
+            .next_hole(self.rtx_next.max(self.local_seq_no), limit)
+    }
+
+    /// NOTE(zfc): the next hole, if the congestion window has room for a full-sized
+    /// repair segment (`min(hole, mss)`); sub-MSS slivers would fragment the hole
+    /// into many tiny retransmissions.
+    fn sack_hole_sendable(&self, mss: usize) -> Option<(TcpSeqNumber, TcpSeqNumber)> {
+        let (a, b) = self.sack_rtx_candidate()?;
+        if self.cwnd_remaining() >= (b - a).min(mss).max(1) {
+            Some((a, b))
+        } else {
+            None
+        }
     }
 
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
@@ -2318,6 +2470,45 @@ impl<'a> Socket<'a> {
         }
 
         if let Some(ack_number) = repr.ack_number {
+            // NOTE(zfc): record the peer's SACK blocks (RFC 2018). The tx buffer has
+            // already been advanced to `ack_number`, so it ends at the highest
+            // sequence number we can have sent; blocks outside (ack, that] are
+            // ignored (D-SACKs, stale or bogus blocks).
+            if self.remote_has_sack {
+                let snd_max = ack_number + self.tx_buffer.len();
+                for &(l, r) in repr.sack_ranges.iter().flatten() {
+                    let (l, r) = (TcpSeqNumber(l as i32), TcpSeqNumber(r as i32));
+                    if l > ack_number && r > l && r <= snd_max {
+                        self.sack_board.add(l, r);
+                    }
+                }
+                self.sack_board.prune(ack_number);
+
+                if self.recovery_point.is_some()
+                    && self.rtx_next > ack_number
+                    && self
+                        .sack_board
+                        .highest()
+                        .is_some_and(|h| h > self.rtx_pass_frontier)
+                {
+                    self.rtx_next = ack_number;
+                    self.rtx_pass_frontier = self.remote_last_seq;
+                    self.loss_stats.lost_retransmit_rescan += 1;
+                }
+
+                // RFC 6675 §5 (DupThresh via SACK): three segments' worth of SACKed
+                // data above snd_una means snd_una is lost, even if the duplicate
+                // ACKs were disqualified (a growing receive window makes every one
+                // of them a window update).
+                if self.recovery_point.is_none()
+                    && !matches!(self.timer, Timer::FastRetransmit)
+                    && self.sack_board.sacked_bytes() >= 3 * self.remote_mss
+                {
+                    self.timer.set_for_fast_retransmit();
+                    self.loss_stats.sack_triggered_recovery += 1;
+                }
+            }
+
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
@@ -2345,7 +2536,9 @@ impl<'a> Socket<'a> {
                         }
                     );
 
-                    if self.local_rx_dup_acks == 3 {
+                    // NewReno: dup-ACKs inside an ongoing recovery do not re-enter it;
+                    // partial ACKs drive the retransmissions there.
+                    if self.local_rx_dup_acks == 3 && self.recovery_point.is_none() {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2377,6 +2570,20 @@ impl<'a> Socket<'a> {
                         new_flight_size,
                         &self.rtte,
                     );
+
+                    // NewReno (RFC 6582 §3.2): a full ACK ends recovery; a partial
+                    // ACK means the next segment is lost too — retransmit it now.
+                    // With SACK information the hole walk (`sack_rtx_candidate`)
+                    // already covers it; a second copy would only waste the pipe.
+                    if let Some(recovery_point) = self.recovery_point {
+                        if ack_number >= recovery_point {
+                            self.recovery_point = None;
+                            self.rto_recovery = false;
+                        } else if ack_len > 0 && self.sack_board.is_empty() {
+                            self.pending_fast_retransmit = true;
+                            self.loss_stats.partial_ack_retransmit += 1;
+                        }
+                    }
                 }
             };
 
@@ -2528,6 +2735,11 @@ impl<'a> Socket<'a> {
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
         // Fast retransmits should always send, even if later congestion checks would disallow
         if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
+            return true;
+        }
+
+        // NOTE(zfc): a SACK-identified hole to repair, within the congestion window.
+        if self.sack_hole_sendable(effective_mss_for(cx, self)).is_some() {
             return true;
         }
 
@@ -2710,6 +2922,7 @@ impl<'a> Socket<'a> {
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting after rto");
+                self.loss_stats.rto += 1;
 
                 // Inform the congestion controller that we're retransmitting and should enter the slow start state
                 let in_flight = self.flight_size();
@@ -2717,16 +2930,40 @@ impl<'a> Socket<'a> {
                     .inner_mut()
                     .on_rto(cx.now(), in_flight);
 
-                // Rewind "last sequence number sent", as if we never
-                // had sent them. This will cause all data in the queue
-                // to be sent again.
-                self.remote_last_seq = self.local_seq_no;
+                self.pending_fast_retransmit = false;
+                if self.rto_una == Some(self.local_seq_no) && !self.sack_board.is_empty() {
+                    // No progress since the previous RTO despite retransmitting every
+                    // hole: the peer may have reneged on its SACKs.
+                    self.sack_board.clear();
+                    self.loss_stats.sack_reneging_fallback += 1;
+                }
+                self.rto_una = Some(self.local_seq_no);
+                if self.sack_board.is_empty() {
+                    // Rewind "last sequence number sent", as if we never
+                    // had sent them. This will cause all data in the queue
+                    // to be sent again.
+                    self.remote_last_seq = self.local_seq_no;
+                    // An RTO supersedes any fast recovery in progress.
+                    self.recovery_point = None;
+                    self.rto_recovery = false;
+                } else {
+                    // NOTE(zfc): with SACK information, retransmit only what the
+                    // peer does not have: every un-SACKed byte up to the current
+                    // send frontier is presumed lost and walked hole by hole
+                    // (cwnd-limited, the controller has just collapsed it),
+                    // instead of resending SACKed data too.
+                    self.recovery_point = Some(self.remote_last_seq);
+                    self.rto_recovery = true;
+                    self.rtx_next = self.local_seq_no;
+                    self.rtx_pass_frontier = self.remote_last_seq;
+                }
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
             } else {
                 // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
                 net_debug!("retransmitting for fast-retransmit");
+                self.loss_stats.fast_retransmit += 1;
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
@@ -2735,6 +2972,13 @@ impl<'a> Socket<'a> {
                     .on_loss(cx.now(), in_flight);
 
                 self.pending_fast_retransmit = true;
+                if self.recovery_point.is_none() {
+                    self.recovery_point = Some(self.remote_last_seq);
+                    self.rto_recovery = false;
+                }
+                // The fast retransmit itself covers the first segment at snd_una.
+                self.rtx_next = self.local_seq_no;
+                self.rtx_pass_frontier = self.remote_last_seq;
             }
 
             // Clear the `should_retransmit` state. If we can't retransmit right
@@ -2866,14 +3110,33 @@ impl<'a> Socket<'a> {
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
+                let sack_hole = if self.pending_fast_retransmit {
+                    None
+                } else {
+                    self.sack_hole_sendable(effective_mss)
+                };
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
                     self.pending_fast_retransmit = false;
+                    self.rtx_next = self.rtx_next.max(self.local_seq_no + repr.payload.len());
 
                     0
+                } else if let Some((hole_start, hole_end)) = sack_hole {
+                    // NOTE(zfc): SACK recovery — retransmit (part of) the next hole.
+                    let size = (hole_end - hole_start)
+                        .min(effective_mss)
+                        .min(self.cwnd_remaining());
+                    let offset = hole_start - self.local_seq_no;
+                    repr.seq_number = hole_start;
+                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    self.rtx_next = hole_start + repr.payload.len();
+                    // Karn: an RTT sample spanning a retransmission is bogus.
+                    self.rtte.on_retransmit();
+                    self.loss_stats.sack_retransmit += 1;
+                    offset
                 } else {
                     // Right edge of window, ie the max sequence number we're allowed to send.
                     let win_right_edge = self.local_seq_no + self.remote_win_len;
@@ -7329,6 +7592,317 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + (3 * 5)),
             ..SEND_TEMPL
         });
+    }
+
+    #[test]
+    fn test_fast_retransmit_newreno_partial_ack_retransmits_next_hole() {
+        // Two segments of one window are lost ("aaa" and "ccc"). After the fast
+        // retransmit of "aaa", the ACK for "aaa"+"BBB" is partial (below the
+        // recovery point) and must retransmit "ccc" immediately (RFC 6582), not
+        // wait for three more duplicate ACKs or an RTO.
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDDeeeFFF").unwrap();
+        for (i, chunk) in [&b"aaa"[..], b"BBB", b"ccc", b"DDD", b"eee", b"FFF"].iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    chunk,
+                ..RECV_TEMPL
+            }));
+        }
+        // BBB, DDD, eee, FFF arrive -> duplicate ACKs for "aaa".
+        for t in [1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        // Partial ACK: "aaa" + "BBB" are in, "ccc" is the next hole.
+        send!(s, time 1100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        // Full ACK ends recovery; nothing further to send.
+        send!(s, time 1150, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 18),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recovery_point, None);
+        recv_nothing!(s, time 1150);
+    }
+
+    /// Six 3-byte segments sent; "aaa" and "ccc" lost. Returns the socket after the
+    /// three duplicate ACKs, each carrying SACK blocks for what did arrive.
+    fn sack_two_holes_after_dup_acks() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        s.remote_has_sack = true;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDDeeeFFF").unwrap();
+        for (i, chunk) in [&b"aaa"[..], b"BBB", b"ccc", b"DDD", b"eee", b"FFF"].iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    chunk,
+                ..RECV_TEMPL
+            }));
+        }
+        let una = (LOCAL_SEQ + 1).0 as u32;
+        let sacks: [[Option<(u32, u32)>; 3]; 3] = [
+            [Some((una + 3, una + 6)), None, None],
+            [Some((una + 9, una + 12)), Some((una + 3, una + 6)), None],
+            [Some((una + 9, una + 18)), Some((una + 3, una + 6)), None],
+        ];
+        for (t, sack) in [1050, 1055, 1060].into_iter().zip(sacks) {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: sack,
+                ..SEND_TEMPL
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn test_sack_recovery_repairs_all_holes_in_one_episode() {
+        let mut s = sack_two_holes_after_dup_acks();
+        // Fast retransmit of the first hole...
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        // ...and the second hole right away, without waiting for a partial ACK.
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        // SACKed data ("BBB", "DDD", "eee", "FFF") is never resent.
+        recv_nothing!(s, time 1070);
+        // Partial ACK for aaa+BBB must not trigger a duplicate copy of "ccc".
+        send!(s, time 1100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            sack_ranges: [Some(((LOCAL_SEQ + 1).0 as u32 + 9, (LOCAL_SEQ + 1).0 as u32 + 18)), None, None],
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 1100);
+        send!(s, time 1150, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 18),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recovery_point, None);
+        assert!(s.sack_board.is_empty());
+    }
+
+    #[test]
+    fn test_sack_rto_resends_only_unsacked_data() {
+        let mut s = sack_two_holes_after_dup_acks();
+        // Let the fast retransmits go out and get lost as well.
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1070);
+        // RTO: only the holes are resent, not the SACKed segments.
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 5000);
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_sack_rto_recovery_not_deadlocked_by_unsacked_holes() {
+        // After the RTO, Reno drops cwnd to one MSS while the two lost holes are
+        // two MSS. Counting presumed-lost holes as "in flight" would leave no room
+        // to retransmit either of them, forever.
+        let mut s = sack_two_holes_after_dup_acks();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.congestion_controller.inner_mut().set_mss(3);
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        // RTO fires with both holes still outstanding: the first hole must go out.
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_sack_lost_retransmission_rescanned_without_rto() {
+        let mut s = sack_two_holes_after_dup_acks();
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        // New data goes out after the repair pass...
+        s.send_slice(b"GGG").unwrap();
+        recv!(s, time 1080, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 18,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"GGG"[..],
+            ..RECV_TEMPL
+        }));
+        // ...and is SACKed while both retransmissions are still missing: they were lost.
+        let una = (LOCAL_SEQ + 1).0 as u32;
+        send!(s, time 1100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            sack_ranges: [Some((una + 9, una + 21)), Some((una + 3, una + 6)), None],
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.loss_stats().lost_retransmit_rescan, 1);
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.loss_stats().rto, 0);
+    }
+
+    #[test]
+    fn test_sack_reneging_second_rto_resends_everything() {
+        let mut s = sack_two_holes_after_dup_acks();
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        // First RTO: holes only.
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
+        // Second RTO without any progress: SACK info is no longer trusted and the
+        // SACKed "BBB" is resent too.
+        let mut sent = std::vec::Vec::new();
+        s.cx.set_now(Instant::from_millis(60_000));
+        for _ in 0..8 {
+            let _ = s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
+                sent.push(tcp.seq_number);
+                Ok::<(), ()>(())
+            });
+        }
+        assert_eq!(s.loss_stats().sack_reneging_fallback, 1, "sent {sent:?}");
+        assert!(sent.contains(&(LOCAL_SEQ + 1 + 3)), "SACKed data must be resent, sent {sent:?}");
+    }
+
+    #[test]
+    fn test_sack_triggers_recovery_when_dup_acks_carry_window_updates() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        s.remote_has_sack = true;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for (i, chunk) in [&b"aaa"[..], b"BBB", b"ccc", b"DDD"].iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    chunk,
+                ..RECV_TEMPL
+            }));
+        }
+        let una = (LOCAL_SEQ + 1).0 as u32;
+        // Each "duplicate" ACK also opens the window, so none counts as a dup ACK.
+        for (i, t) in [1050, 1055, 1060].into_iter().enumerate() {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 256 + 64 * (i as u16 + 1),
+                sack_ranges: [Some((una + 3, una + 6 + 3 * i as u32)), None, None],
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.loss_stats().sack_triggered_recovery, 1);
+        recv!(s, time 1070, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]
